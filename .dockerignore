@@ -1,0 +1,6 @@
+**
+!starter-duckdb/
+!starter-duckdb/requirements.txt
+!starter-duckdb/pipeline/
+!starter-duckdb/pipeline/*.py
+!starter-duckdb/run.sh
