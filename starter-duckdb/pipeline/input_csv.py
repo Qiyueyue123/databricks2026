@@ -92,6 +92,8 @@ def write_identity_map(files, target_path):
 
 
 def prepare(data: Path, scratch: Path, threads: int):
+    # TODO: Time CSV preparation on native Xeon hardware before choosing
+    # an optimization. It was the slowest stage in the local Docker run.
     normalize([data / "products.csv"], scratch / "products.csv", PRODUCTS)
     normalize([data / "campaigns.csv"], scratch / "campaigns.csv", CAMPAIGNS)
     inputs = [(kind, names, list((data / kind).glob("*.csv")))

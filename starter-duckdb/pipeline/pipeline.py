@@ -15,6 +15,20 @@ from input_csv import CAMPAIGNS, CLICKS, EVENTS, PRODUCTS, prepare
 
 WEEK_MS = 604_800_000
 
+# Original starter checklist, kept as a guide. The working code below
+# implements these steps.
+#
+# TODO: implement the rules.
+#   Events: parse -> dedup on event_id (smallest ingest_ts, before validation)
+#           -> validate -> drop late -> sessionize per user (gap > 30 min)
+#           -> day of session start -> categories
+#   Clicks: parse -> dedup -> validate -> credit each session to the latest
+#           click at or before its start, within 7 days (ties: smallest click_id)
+#
+# Careful with DuckDB's CSV reader: it repairs or rejects malformed lines in its
+# own way, and it reads a quoted empty field "" as '' rather than null. Check its
+# behaviour against the fixtures before trusting it with the dialect rules.
+
 
 def literal(value):
     return "'" + str(value).replace("'", "''") + "'"
@@ -67,6 +81,7 @@ def run(con, output, scratch, window):
     register_csv(con, "products", scratch / "products.csv", PRODUCTS)
     register_csv(con, "campaigns", scratch / "campaigns.csv", CAMPAIGNS)
 
+    # Clean events, group them into visits, and write one row per person and day.
     started = perf_counter()
     # Treat a winning duplicate as one complete row, including null fields.
     con.execute("""
@@ -137,6 +152,7 @@ def run(con, output, scratch, window):
     con.execute("DROP TABLE session_events")
     report("Built sessions and wrote user_daily", started)
 
+    # Clean clicks and map each click to the same person IDs as the events.
     started = perf_counter()
     con.execute("""
         CREATE TEMP TABLE clicks AS
@@ -155,6 +171,7 @@ def run(con, output, scratch, window):
     """, [start - WEEK_MS, end])
     report("Prepared valid clicks", started)
 
+    # Credit each session once and count each campaign that helped bring it in.
     started = perf_counter()
     export(con, output, "campaign_daily", f"""
         WITH best_clicks AS (
