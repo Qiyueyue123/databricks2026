@@ -1,7 +1,9 @@
 """Parse the scorer's byte-oriented CSV dialect before loading DuckDB."""
 
 from array import array
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import ctypes
+import os
 from pathlib import Path
 
 
@@ -9,6 +11,20 @@ EVENTS = ("event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", 
 CLICKS = ("click_id", "user_id", "campaign_id", "ts")
 PRODUCTS = ("product_id", "category")
 CAMPAIGNS = ("campaign_id", "channel")
+
+
+def load_normalizer():
+    library = Path(os.environ.get("CSV_NORMALIZER_LIBRARY", Path(__file__).with_name("_input_csv.so")))
+    if not library.is_file():
+        return None
+    normalize = ctypes.CDLL(str(library.resolve())).normalize_csv
+    normalize.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t,
+                          ctypes.c_size_t, ctypes.POINTER(ctypes.c_char_p), ctypes.c_size_t)
+    normalize.restype = ctypes.c_int
+    return normalize
+
+
+native_normalize = load_normalizer()
 
 
 def rows(files, width):
@@ -32,18 +48,32 @@ def rows(files, width):
                     yield fields
 
 
-def write_row(target, fields):
+def encode_row(fields):
     # Quote carriage returns so DuckDB preserves them as field content.
     line = b",".join(fields)
     if b"\r" in line:
         fields = [b'"' + field + b'"' if b"\r" in field else field for field in fields]
         line = b",".join(fields)
-    target.write(line + b"\n")
+    return line + b"\n"
+
+
+def write_row(target, fields):
+    target.write(encode_row(fields))
 
 
 def normalize(source_files, target_path, names):
+    header = encode_row([name.encode() for name in names])
+    if native_normalize is not None:
+        paths = [os.fsencode(path) for path in source_files]
+        paths = (ctypes.c_char_p * len(paths))(*paths)
+        error = native_normalize(os.fsencode(target_path), header, len(header),
+                                 len(names), paths, len(paths))
+        if error:
+            raise OSError(error, f"CSV normalization failed: {os.strerror(error)}", target_path)
+        return
+
     with target_path.open("wb") as target:
-        write_row(target, [name.encode() for name in names])
+        target.write(header)
         for fields in rows(source_files, len(names)):
             if fields[0]:
                 write_row(target, fields)
@@ -117,7 +147,9 @@ def prepare(data: Path, scratch: Path, threads: int):
             jobs.append((path, scratch / f"{kind}-{i}.csv", names))
     jobs.sort(key=lambda job: sizes[job[0]], reverse=True)
 
-    with ProcessPoolExecutor(max_workers=min(threads - 1, len(jobs))) as pool:
+    # ctypes releases the GIL while the native normalizer runs.
+    executor = ThreadPoolExecutor if native_normalize is not None else ProcessPoolExecutor
+    with executor(max_workers=min(threads - 1, len(jobs))) as pool:
         pending = [pool.submit(normalize, [path], target, names)
                    for path, target, names in jobs]
         write_identity_map(links, identity_path)

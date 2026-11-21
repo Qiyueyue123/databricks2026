@@ -39,7 +39,8 @@ def register_csv(con, name, path, columns):
     con.execute(f"""
         CREATE VIEW {name} AS
         SELECT * FROM read_csv({literal(path)}, header=true, auto_detect=false,
-                               delim=',', new_line='\\n', nullstr='', columns={{{schema}}})
+                               delim=',', new_line='\\n', nullstr='', allow_quoted_nulls=true,
+                               columns={{{schema}}})
     """)
 
 
@@ -56,17 +57,18 @@ def report(stage, started):
 
 def run(con, output, scratch, window):
     con.execute("""
-        CREATE MACRO iso_ms(s) AS
-            epoch_ms(TRY_STRPTIME(s, '%Y-%m-%dT%H:%M:%S'));
+        CREATE MACRO iso_ms(s) AS epoch_ms(TRY_CAST(s AS TIMESTAMP));
+        -- Check the form before casting. DuckDB accepts 24:00:00 on its own.
         CREATE MACRO timestamp_ms(s) AS CASE
-            WHEN regexp_full_match(s, '[0-9]+')
-                THEN TRY_CAST(COALESCE(NULLIF(ltrim(s, '0'), ''), '0') AS BIGINT)
-            WHEN regexp_full_match(s,
-                    '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z')
-                THEN iso_ms(left(s, 19))
-            WHEN regexp_full_match(s,
-                    '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-]([01][0-9]|2[0-3]):[0-5][0-9]')
-                THEN iso_ms(left(s, 19)) - CASE WHEN s[20] = '-' THEN -1 ELSE 1 END
+            WHEN NOT contains(s, '-') THEN CASE
+                WHEN regexp_full_match(s, '[0-9]+') THEN TRY_CAST(s AS BIGINT)
+                END
+            WHEN length(s) = 20 AND regexp_full_match(s,
+                    '[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-9]{2}:[0-9]{2}Z')
+                THEN iso_ms(s)
+            WHEN length(s) = 25 AND regexp_full_match(s,
+                    '[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-9]{2}:[0-9]{2}[+-]([01][0-9]|2[0-3]):[0-5][0-9]')
+                THEN iso_ms(s) - CASE WHEN s[20] = '-' THEN -1 ELSE 1 END
                     * (CAST(s[21:22] AS BIGINT) * 60 + CAST(s[24:25] AS BIGINT)) * 60000
             END;
     """)
@@ -83,40 +85,42 @@ def run(con, output, scratch, window):
 
     # Clean events, group them into visits, and write one row per person and day.
     started = perf_counter()
-    # Treat a winning duplicate as one complete row, including null fields.
     con.execute("""
         CREATE TEMP TABLE session_events AS
-        WITH dedup AS (
-            SELECT arg_min(
-                struct_pack(user_id := user_id, ts := ts, ingest_ts := ingest_ts,
-                            event_type := event_type, product_id := product_id, price_cents := price_cents),
-                ingest_ts
-            ) AS event
+        WITH decoded AS (
+            SELECT event_id, user_id, timestamp_ms(ts) AS ts, iso_ms(ingest_ts) AS ingest,
+                   product_id, event_type,
+                   CASE WHEN event_type = 'purchase' AND regexp_full_match(price_cents, '[0-9]+')
+                        THEN TRY_CAST(price_cents AS INTEGER) END AS cents
             FROM raw_events
-            GROUP BY event_id
-        ), decoded AS (
-            SELECT event.user_id AS user_id, timestamp_ms(event.ts) AS ts,
-                   iso_ms(left(event.ingest_ts, 19)) AS ingest,
-                   event.product_id AS product_id, event.event_type AS event_type,
-                   CASE WHEN event.event_type = 'purchase' AND regexp_full_match(event.price_cents, '[0-9]+')
-                        THEN TRY_CAST(COALESCE(NULLIF(ltrim(event.price_cents, '0'), ''), '0') AS INTEGER)
-                   END AS cents
-            FROM dedup
-        ), valid AS (
-            SELECT coalesce(person_id, user_id) AS user_id, ts,
-                   CASE WHEN event_type = 'purchase' THEN product_id END AS purchased_product,
-                   coalesce(cents, 0) AS cents
+        ), dedup AS (
+            -- Keep a null payload for an invalid row so it can still win deduplication.
+            SELECT arg_min_null(
+                CASE WHEN user_id IS NOT NULL AND product_id IS NOT NULL
+                       AND ts >= ? AND ts < ? AND ts >= ingest - 86400000
+                       AND (event_type IN ('view', 'cart') OR
+                            (event_type = 'purchase' AND cents BETWEEN 1 AND 10000000))
+                     THEN struct_pack(
+                         user_id := user_id, ts := ts, cents := coalesce(cents, 0),
+                         purchased_product := CASE WHEN event_type = 'purchase' THEN product_id END
+                     )
+                END,
+                ingest
+            ) AS event
             FROM decoded
-            LEFT JOIN identities ON source_id = user_id
-            WHERE user_id IS NOT NULL AND product_id IS NOT NULL
-              AND ts >= ? AND ts < ? AND ingest - ts <= 86400000
-              AND (event_type IN ('view', 'cart') OR (event_type = 'purchase' AND cents BETWEEN 1 AND 10000000))
+            GROUP BY event_id
+        ), valid AS (
+            SELECT coalesce(person_id, event.user_id) AS user_id,
+                   event.ts AS ts, event.purchased_product AS purchased_product, event.cents AS cents
+            FROM dedup
+            LEFT JOIN identities ON source_id = event.user_id
+            WHERE event IS NOT NULL
         ), with_gaps AS (
             SELECT *, ts - lag(ts) OVER (PARTITION BY user_id ORDER BY ts) AS gap
             FROM valid
         )
         SELECT user_id, purchased_product, cents,
-               max(CASE WHEN gap IS NULL OR gap > 1800000 THEN ts END) OVER (
+               last_value(CASE WHEN gap IS NULL OR gap > 1800000 THEN ts END IGNORE NULLS) OVER (
                    PARTITION BY user_id ORDER BY ts
                    RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                ) AS session_start
@@ -187,7 +191,8 @@ def run(con, output, scratch, window):
             ASOF LEFT JOIN best_clicks c ON s.user_id = c.user_id AND s.session_start >= c.ts
             GROUP BY 1, 2
         ), person_days AS (
-            SELECT user_id, day, min(session_start) AS first_start, max(session_start) AS last_start
+            SELECT user_id, day, min(session_start) AS first_start,
+                   max(session_start) AS last_start, list(session_start) AS starts
             FROM sessions GROUP BY user_id, day
         ), intervals AS (
             -- The next click for this campaign covers any overlap. Keeping
@@ -196,22 +201,16 @@ def run(con, output, scratch, window):
                    least(ts + {WEEK_MS},
                          lead(ts) OVER (PARTITION BY user_id, campaign_id ORDER BY ts) - 1) AS hi
             FROM clicks
-        ), endpoints AS (
-            SELECT i.user_id, i.campaign_id, d.day, boundary.ts, boundary.sign
-            FROM intervals i
-            JOIN person_days d ON i.user_id = d.user_id AND i.lo <= d.last_start AND i.hi >= d.first_start
-            CROSS JOIN LATERAL (VALUES (i.hi, 1), (i.lo - 1, -1)) boundary(ts, sign)
-        ), ranks AS (
-            SELECT user_id, session_start, day,
-                   row_number() OVER (PARTITION BY user_id, day ORDER BY session_start) AS session_rank
-            FROM sessions
         ), assisted AS (
-            -- Subtract the rank at lo - 1 from the rank at hi to count [lo, hi].
-            SELECT e.campaign_id, e.day,
-                   sum(coalesce(r.session_rank, 0) * e.sign)::BIGINT AS assisted_sessions
-            FROM endpoints e
-            ASOF LEFT JOIN ranks r ON e.user_id = r.user_id AND e.day = r.day AND e.ts >= r.session_start
-            GROUP BY 1, 2
+            -- Session starts are over 30 minutes apart, so a day has at most 48.
+            SELECT i.campaign_id, d.day,
+                   sum(CASE WHEN i.lo <= d.first_start AND i.hi >= d.last_start
+                            THEN len(d.starts)
+                            ELSE len(list_filter(d.starts, t -> t BETWEEN i.lo AND i.hi))
+                       END)::BIGINT AS assisted_sessions
+            FROM intervals i JOIN person_days d
+              ON i.user_id = d.user_id AND i.lo <= d.last_start AND i.hi >= d.first_start
+            GROUP BY i.campaign_id, d.day
             HAVING assisted_sessions > 0
         )
         SELECT campaign_id, coalesce(channel, 'organic') AS channel, day,

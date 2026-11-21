@@ -1,6 +1,11 @@
 # Shopping Sessions starter: DuckDB skeleton.
 # The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
 # no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
+FROM python:3.12-slim-bookworm AS csv-build
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev
+COPY pipeline/input_csv.c /input_csv.c
+RUN gcc -O3 -std=c11 -fPIC -shared /input_csv.c -o /_input_csv.so
+
 FROM python:3.12-slim-bookworm
 
 # The scorer runs the container as uid 1000; give that uid a name and a home.
@@ -10,6 +15,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY pipeline/ /app/pipeline/
+COPY --from=csv-build /_input_csv.so /app/pipeline/
 COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh
 
