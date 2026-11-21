@@ -1,17 +1,19 @@
-FROM python:3.12-slim-bookworm AS csv-build
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev
-COPY starter-duckdb/pipeline/input_csv.c /input_csv.c
-RUN gcc -O3 -std=c11 -fPIC -shared /input_csv.c -o /_input_csv.so
+FROM debian:bookworm-slim AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/*
+COPY starter-duckdb/pipeline/engine.cpp starter-duckdb/pipeline/csv_fast.hpp starter-duckdb/pipeline/parquet_writer.hpp /src/
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "x86_64" ]; then \
+        g++ -O3 -std=c++20 -march=x86-64-v3 -mtune=cascadelake -flto -fno-exceptions -fno-rtti -pthread /src/engine.cpp -o /shopping-sessions; \
+    else \
+        g++ -O3 -std=c++20 -flto -fno-exceptions -fno-rtti -pthread /src/engine.cpp -o /shopping-sessions; \
+    fi
 
-FROM python:3.12-slim-bookworm
-
+FROM debian:bookworm-slim
+RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 WORKDIR /app
-COPY starter-duckdb/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY starter-duckdb/pipeline/ ./pipeline/
-COPY --from=csv-build /_input_csv.so ./pipeline/
-COPY starter-duckdb/run.sh ./run.sh
-
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+COPY --from=builder /shopping-sessions /app/shopping-sessions
+COPY starter-duckdb/run.sh /app/run.sh
+RUN chmod +x /app/shopping-sessions /app/run.sh
 USER 1000:1000
-CMD ["/app/run.sh"]
+CMD ["/app/shopping-sessions"]

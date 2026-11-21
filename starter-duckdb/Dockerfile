@@ -1,29 +1,21 @@
-# Shopping Sessions starter: DuckDB skeleton.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
-FROM python:3.12-slim-bookworm AS csv-build
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev
-COPY pipeline/input_csv.c /input_csv.c
-RUN gcc -O3 -std=c11 -fPIC -shared /input_csv.c -o /_input_csv.so
+# Shopping Sessions: native C++20 engine.
+# The scorers are linux/amd64 (Intel Xeon Cascade Lake+ with AVX-512).
+FROM debian:bookworm-slim AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/*
+COPY pipeline/engine.cpp pipeline/csv_fast.hpp pipeline/parquet_writer.hpp /src/
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "x86_64" ]; then \
+        g++ -O3 -std=c++20 -march=x86-64-v3 -mtune=cascadelake -flto -fno-exceptions -fno-rtti -pthread /src/engine.cpp -o /shopping-sessions; \
+    else \
+        g++ -O3 -std=c++20 -flto -fno-exceptions -fno-rtti -pthread /src/engine.cpp -o /shopping-sessions; \
+    fi
 
-FROM python:3.12-slim-bookworm
-
-# The scorer runs the container as uid 1000; give that uid a name and a home.
+FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY pipeline/ /app/pipeline/
-COPY --from=csv-build /_input_csv.so /app/pipeline/
-COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
-
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
 WORKDIR /app
-CMD ["/app/run.sh"]
+COPY --from=builder /shopping-sessions /app/shopping-sessions
+COPY run.sh /app/run.sh
+RUN chmod +x /app/shopping-sessions /app/run.sh
+USER 1000:1000
+CMD ["/app/shopping-sessions"]

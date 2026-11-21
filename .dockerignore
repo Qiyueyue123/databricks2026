@@ -1,7 +1,7 @@
 **
 !starter-duckdb/
-!starter-duckdb/requirements.txt
 !starter-duckdb/pipeline/
-!starter-duckdb/pipeline/*.py
-!starter-duckdb/pipeline/input_csv.c
+!starter-duckdb/pipeline/engine.cpp
+!starter-duckdb/pipeline/csv_fast.hpp
+!starter-duckdb/pipeline/parquet_writer.hpp
 !starter-duckdb/run.sh
