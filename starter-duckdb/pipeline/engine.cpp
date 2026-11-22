@@ -45,9 +45,11 @@ void ensure_dir(const std::string& path) {
     mkdir(path.c_str(), 0777);
 }
 
+static bool g_use_huge = false;
+
 static inline void* alloc_huge_raw(size_t bytes) {
 #if defined(__linux__)
-    if (bytes >= 2 * 1024 * 1024) {
+    if (g_use_huge && bytes >= 2 * 1024 * 1024) {
         void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p != MAP_FAILED) {
 #if defined(MADV_HUGEPAGE)
@@ -773,7 +775,7 @@ struct SlabArena {
         if (__builtin_expect(rem < slab_bytes, 0)) {
             uint8_t* p = nullptr;
 #if defined(__linux__)
-            if (chunk_bytes >= 2 * 1024 * 1024) {
+            if (g_use_huge && chunk_bytes >= 2 * 1024 * 1024) {
                 void* mp = mmap(nullptr, chunk_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                 if (mp != MAP_FAILED) {
 #if defined(MADV_HUGEPAGE)
@@ -2113,7 +2115,11 @@ int main() {
     size_t hw_threads = std::thread::hardware_concurrency();
     if (hw_threads == 0) hw_threads = 1;
     size_t ncpu = env_ncpu ? static_cast<size_t>(std::max(1, std::atoi(env_ncpu))) : std::min<size_t>(8, hw_threads);
-    bool use_mmap = env_mmap ? (std::atoi(env_mmap) != 0) : true;
+    bool use_mmap = env_mmap ? (std::atoi(env_mmap) != 0) : false;
+    const char* env_pf = std::getenv("PREFETCH");
+    bool use_prefetch = env_pf ? (std::atoi(env_pf) != 0) : true;
+    const char* env_huge = std::getenv("HUGE");
+    if (env_huge) g_use_huge = (std::atoi(env_huge) != 0);
 
     ensure_dir(out_dir);
     ensure_dir(out_dir + "/user_daily");
@@ -2249,7 +2255,7 @@ int main() {
     // cache, but keeps the block device queue full on a COLD /data so mmap faults hit page cache!
     std::thread prefetcher;
 #if defined(__linux__) && defined(POSIX_FADV_WILLNEED)
-    if (use_mmap && total_event_bytes >= 32ULL * 1024 * 1024) {
+    if (use_prefetch && use_mmap && total_event_bytes >= 32ULL * 1024 * 1024) {
         prefetcher = std::thread([&]() {
             constexpr size_t STEP = 4ULL * 1024 * 1024;
             auto adv = [&](const InputFile& f) {
