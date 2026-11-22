@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +22,9 @@
 
 #if defined(__linux__)
 #include <sched.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -56,24 +60,60 @@ void ensure_dir(const std::string& path) {
 
 static bool g_use_huge = true;
 
-// 2MB-aligned anonymous mmap with MADV_HUGEPAGE (zero munmap -> zero TLB shootdowns).
-static inline void* alloc_huge_raw(size_t bytes) {
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
-    if (g_use_huge && bytes >= 2 * 1024 * 1024) {
+struct HugeRegion {
+    void* ptr;
+    size_t len;
+};
+static HugeRegion g_huge_regs[4096];
+static std::atomic<uint32_t> g_huge_reg_cnt{0};
+
+static inline void register_huge_region(void* ptr, size_t len) {
+    if (!ptr || len < 262144) return;
+    uint32_t idx = g_huge_reg_cnt.fetch_add(1, std::memory_order_relaxed);
+    if (idx < 4096) g_huge_regs[idx] = HugeRegion{ptr, len};
+}
+
+// 2MB-aligned anonymous mmap with MADV_HUGEPAGE + exit teardown registration!
+static inline void* alloc_huge_raw(size_t bytes, bool* out_is_zeroed = nullptr) {
+#if defined(__linux__)
+    if (bytes >= 2 * 1024 * 1024) {
         constexpr size_t HP = 2ULL << 20;
         size_t aligned = (bytes + HP - 1) & ~(HP - 1);
         void* raw = mmap(nullptr, aligned + HP, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (raw != MAP_FAILED) {
             uintptr_t addr = (reinterpret_cast<uintptr_t>(raw) + HP - 1) & ~(HP - 1);
             void* p = reinterpret_cast<void*>(addr);
-            madvise(p, aligned, MADV_HUGEPAGE);
+#if defined(MADV_HUGEPAGE)
+            if (g_use_huge) madvise(p, aligned, MADV_HUGEPAGE);
+#endif
+            register_huge_region(raw, aligned + HP);
+            if (out_is_zeroed) *out_is_zeroed = true;
             return p;
         }
     }
 #endif
+    if (out_is_zeroed) *out_is_zeroed = false;
     void* p = nullptr;
     if (posix_memalign(&p, 64, std::max<size_t>(64, bytes)) == 0) return p;
     return std::malloc(bytes);
+}
+
+static std::atomic<bool> g_popw_ok{true};
+
+static inline void* alloc_huge_zeroed(size_t bytes) {
+    bool is_mmap = false;
+    void* p = alloc_huge_raw(bytes, &is_mmap);
+    if (!p) return nullptr;
+#if defined(__linux__) && defined(MADV_POPULATE_WRITE)
+    if (is_mmap && g_popw_ok.load(std::memory_order_relaxed)) {
+        constexpr size_t HP = 2ULL << 20;
+        size_t aligned = (bytes + HP - 1) & ~(HP - 1);
+        if (madvise(p, aligned, MADV_POPULATE_WRITE) == 0) return p;
+        if (errno == EINVAL) g_popw_ok.store(false, std::memory_order_relaxed);
+    }
+#endif
+    std::memset(p, 0, bytes);
+    return p;
 }
 
 static size_t detect_cpus() {
@@ -478,27 +518,75 @@ struct LongUserTable {
         std::atomic<size_t> next_b{0};
         team.run([&](size_t tid) {
             if (tid >= num_threads) return;
+            std::vector<uint32_t> ht_idx;
             while (true) {
                 size_t b = next_b.fetch_add(1, std::memory_order_relaxed);
                 if (b >= 256) break;
                 uint32_t lo = bucket_lo[b];
                 uint32_t hi = raw_end[b];
-                if (hi - lo <= 1) {
+                uint32_t cnt = hi - lo;
+                if (cnt <= 1) {
                     bucket_hi[b] = hi;
                     continue;
                 }
                 U128* beg = data_ + lo;
-                U128* end = data_ + hi;
-                std::sort(beg, end);
-                U128* w = beg + 1;
-                for (U128* r = beg + 1; r < end; ++r) {
-                    if (r->hi == w[-1].hi && r->lo == w[-1].lo) continue;
-                    if (__builtin_expect((r->hi >> 9) == (w[-1].hi >> 9), 0)) {
-                        ok.store(false, std::memory_order_relaxed);
+                if (cnt > 64) {
+                    // L1-resident hash dedup BEFORE sort (drops ~85% duplicates in O(N)!)
+                    size_t hcap = next_pow2(std::clamp<size_t>(cnt, 64, 4096));
+                    if (ht_idx.size() < hcap) ht_idx.resize(hcap);
+                    std::memset(ht_idx.data(), 0, hcap * sizeof(uint32_t));
+                    size_t hmask = hcap - 1;
+                    uint32_t nuniq = 0;
+                    auto grow_ht = [&]() {
+                        hcap *= 2;
+                        hmask = hcap - 1;
+                        ht_idx.assign(hcap, 0);
+                        for (uint32_t u = 0; u < nuniq; ++u) {
+                            size_t sl = static_cast<size_t>(fast::hash_u128(beg[u].hi, beg[u].lo)) & hmask;
+                            while (ht_idx[sl]) sl = (sl + 1) & hmask;
+                            ht_idx[sl] = u + 1;
+                        }
+                    };
+                    for (uint32_t i = 0; i < cnt; ++i) {
+                        U128 cur = beg[i];
+                        size_t sl = static_cast<size_t>(fast::hash_u128(cur.hi, cur.lo)) & hmask;
+                        while (true) {
+                            uint32_t idx_p1 = ht_idx[sl];
+                            if (idx_p1 == 0) {
+                                if (__builtin_expect((nuniq + 1) * 10 >= hcap * 6, 0)) {
+                                    grow_ht();
+                                    sl = static_cast<size_t>(fast::hash_u128(cur.hi, cur.lo)) & hmask;
+                                    while (ht_idx[sl]) sl = (sl + 1) & hmask;
+                                }
+                                beg[nuniq] = cur;
+                                ht_idx[sl] = ++nuniq;
+                                break;
+                            }
+                            const U128& ex = beg[idx_p1 - 1];
+                            if (ex.hi == cur.hi && ex.lo == cur.lo) break;
+                            sl = (sl + 1) & hmask;
+                        }
                     }
-                    *w++ = *r;
+                    std::sort(beg, beg + nuniq);
+                    for (uint32_t i = 1; i < nuniq; ++i) {
+                        if (__builtin_expect((beg[i].hi >> 9) == (beg[i - 1].hi >> 9), 0)) {
+                            ok.store(false, std::memory_order_relaxed);
+                        }
+                    }
+                    bucket_hi[b] = lo + nuniq;
+                } else {
+                    U128* end = data_ + hi;
+                    std::sort(beg, end);
+                    U128* w = beg + 1;
+                    for (U128* r = beg + 1; r < end; ++r) {
+                        if (r->hi == w[-1].hi && r->lo == w[-1].lo) continue;
+                        if (__builtin_expect((r->hi >> 9) == (w[-1].hi >> 9), 0)) {
+                            ok.store(false, std::memory_order_relaxed);
+                        }
+                        *w++ = *r;
+                    }
+                    bucket_hi[b] = static_cast<uint32_t>(w - data_);
                 }
-                bucket_hi[b] = static_cast<uint32_t>(w - data_);
             }
         });
 
@@ -743,15 +831,21 @@ static inline void release_mmap_slice(const char* mp, std::string_view sv) {
 #endif
 }
 
+static std::atomic<bool> g_pop_ok{true};
+
 std::string_view get_aligned_chunk(const InputFile& f, const ReadChunk& ch, std::vector<char>& buf,
                                    bool use_populate = false) {
     const char* mp = f.ensure_mapped();
     if (mp) {
 #if defined(__linux__) && defined(MADV_POPULATE_READ)
-        if (use_populate && ch.end - ch.start >= 262144) {
+        if (use_populate && g_pop_ok.load(std::memory_order_relaxed) && ch.end - ch.start >= 262144) {
             size_t lo = ch.start & ~size_t(4095);
             size_t hi = (std::min<size_t>(f.size, ch.end + 4096) + 4095) & ~size_t(4095);
-            if (hi > lo) madvise(const_cast<char*>(mp + lo), hi - lo, MADV_POPULATE_READ);
+            if (hi > lo) {
+                if (madvise(const_cast<char*>(mp + lo), hi - lo, MADV_POPULATE_READ) != 0 && errno == EINVAL) {
+                    g_pop_ok.store(false, std::memory_order_relaxed);
+                }
+            }
         }
 #else
         (void)use_populate;
@@ -930,13 +1024,11 @@ public:
         bloom_words_ = next_pow2(std::max<size_t>(64, (mapped * 10) / 64));
         if (bloom_words_ > (1U << 19)) bloom_words_ = (1U << 19);
         bloom_mask_ = bloom_words_ - 1;
-        bloom_ = static_cast<uint64_t*>(std::malloc(bloom_words_ * sizeof(uint64_t)));
-        std::memset(bloom_, 0, bloom_words_ * sizeof(uint64_t));
+        bloom_ = static_cast<uint64_t*>(alloc_huge_zeroed(bloom_words_ * sizeof(uint64_t)));
 
         cap_ = next_pow2(std::max<size_t>(16, mapped * 5 / 2));
         mask_ = cap_ - 1;
-        slots_ = static_cast<Slot*>(alloc_huge_raw(cap_ * sizeof(Slot)));
-        std::memset(slots_, 0, cap_ * sizeof(Slot));
+        slots_ = static_cast<Slot*>(alloc_huge_zeroed(cap_ * sizeof(Slot)));
         count_ = mapped;
 
         for (size_t i = 0; i < mapped; ++i) {
@@ -964,13 +1056,11 @@ public:
         bloom_words_ = next_pow2(std::max<size_t>(64, (mapped * 10) / 64));
         if (bloom_words_ > (1U << 19)) bloom_words_ = (1U << 19);
         bloom_mask_ = bloom_words_ - 1;
-        bloom_ = static_cast<uint64_t*>(std::malloc(bloom_words_ * sizeof(uint64_t)));
-        std::memset(bloom_, 0, bloom_words_ * sizeof(uint64_t));
+        bloom_ = static_cast<uint64_t*>(alloc_huge_zeroed(bloom_words_ * sizeof(uint64_t)));
 
         cap_ = next_pow2(std::max<size_t>(16, mapped * 5 / 2));
         mask_ = cap_ - 1;
-        slots_ = static_cast<Slot*>(alloc_huge_raw(cap_ * sizeof(Slot)));
-        std::memset(slots_, 0, cap_ * sizeof(Slot));
+        slots_ = static_cast<Slot*>(alloc_huge_zeroed(cap_ * sizeof(Slot)));
         count_ = mapped;
 
         for (size_t i = 0; i < n; ++i) {
@@ -1124,14 +1214,15 @@ public:
 };
 
 // ============================================================================
-// Compact Event / Click Records & Huge-Page Slab Arenas + NT Staging Sinks
+// Compact Event / Click Records & Intrusive Huge-Page Slabs + Multi-Line WC
 // ============================================================================
 
-struct EvPay {
+struct Ev24 {
+    uint64_t eid;
     uint64_t uid;
     uint64_t meta;
 };
-static_assert(sizeof(EvPay) == 16);
+static_assert(sizeof(Ev24) == 24);
 
 // Exact 128-bit event_id record for the 12.5% Scorer-v5 33-byte hex events (ZERO locks, ZERO collisions!)
 struct LongEv32 {
@@ -1173,39 +1264,54 @@ struct PersonClick {
 };
 static_assert(sizeof(PersonClick) == 24);
 
+// 64B-aligned intrusive slab header -> zero per-bucket std::vector mallocs!
+struct alignas(64) SlabHeader {
+    SlabHeader* next;
+    uint32_t count;
+    uint32_t pad;
+};
+static_assert(sizeof(SlabHeader) == 64);
+
 struct SlabArena {
-    std::vector<uint8_t*> chunks;
-    std::vector<void*> free_list;
+    SlabHeader* free_head = nullptr;
     uint8_t* cur = nullptr;
     size_t rem = 0;
-    size_t slab_bytes = 32768;
-    size_t chunk_bytes = 4 * 1024 * 1024;
+    size_t slab_bytes = 16384;
+    size_t chunk_bytes = 64 * 1024 * 1024;
 
-    void init(size_t sb, size_t cb = 4 * 1024 * 1024) {
-        slab_bytes = sb;
-        chunk_bytes = std::max(cb, sb * 16);
+    void alloc_chunk() {
+        uint8_t* p = static_cast<uint8_t*>(alloc_huge_raw(chunk_bytes));
+        cur = p;
+        rem = chunk_bytes;
     }
 
-    void* alloc() {
-        if (!free_list.empty()) {
-            void* p = free_list.back();
-            free_list.pop_back();
-            return p;
+    void init(size_t sb, size_t cb, bool prealloc = false) {
+        slab_bytes = sb;
+        chunk_bytes = std::max(cb, sb * 16);
+        free_head = nullptr;
+        cur = nullptr;
+        rem = 0;
+        if (prealloc) alloc_chunk();
+    }
+
+    SlabHeader* alloc() {
+        if (free_head) {
+            SlabHeader* h = free_head;
+            free_head = h->next;
+            return h;
         }
         if (__builtin_expect(rem < slab_bytes, 0)) {
-            uint8_t* p = static_cast<uint8_t*>(alloc_huge_raw(chunk_bytes));
-            chunks.push_back(p);
-            cur = p;
-            rem = chunk_bytes;
+            alloc_chunk();
         }
-        void* out = cur;
+        SlabHeader* out = reinterpret_cast<SlabHeader*>(cur);
         cur += slab_bytes;
         rem -= slab_bytes;
         return out;
     }
 
-    void recycle(void* p) {
-        free_list.push_back(p);
+    void recycle(SlabHeader* h) {
+        h->next = free_head;
+        free_head = h;
     }
 };
 
@@ -1215,35 +1321,37 @@ struct SlabCursor {
     T* end = nullptr;
 };
 
-template <typename T>
-struct SlabList {
-    std::vector<T*> slabs;
-    std::vector<uint32_t> counts;
+struct SlabChain {
+    SlabHeader* head = nullptr;
+    SlabHeader* tail = nullptr;
     uint32_t total_count = 0;
 };
 
 template <typename T>
 struct BucketSet {
     std::vector<SlabCursor<T>> cursors;
-    std::vector<SlabList<T>> lists;
+    std::vector<SlabChain> lists;
     uint32_t cap_per_slab = 1;
 
     void init(size_t nb, size_t sb) {
-        cap_per_slab = static_cast<uint32_t>(std::max<size_t>(1, sb / sizeof(T)));
+        size_t avail = (sb > sizeof(SlabHeader)) ? (sb - sizeof(SlabHeader)) : sizeof(T);
+        cap_per_slab = static_cast<uint32_t>(std::max<size_t>(1, avail / sizeof(T)));
         cursors.assign(nb, SlabCursor<T>{nullptr, nullptr});
-        lists.resize(nb);
+        lists.assign(nb, SlabChain{});
     }
 
     __attribute__((noinline))
     void alloc_next(size_t b, SlabArena& arena) {
         auto& lst = lists[b];
         auto& c = cursors[b];
-        if (c.cur != nullptr) {
-            lst.counts.back() = cap_per_slab;
-        }
-        T* p = static_cast<T*>(arena.alloc());
-        lst.slabs.push_back(p);
-        lst.counts.push_back(0);
+        if (lst.tail != nullptr) lst.tail->count = cap_per_slab;
+        SlabHeader* h = arena.alloc();
+        h->next = nullptr;
+        h->count = 0;
+        if (lst.tail) lst.tail->next = h;
+        else lst.head = h;
+        lst.tail = h;
+        T* p = reinterpret_cast<T*>(h + 1);
         c.cur = p;
         c.end = p + cap_per_slab;
     }
@@ -1256,15 +1364,15 @@ struct BucketSet {
         *c.cur++ = item;
     }
 
-    void finish_all() {
+    void finish_all(SlabArena&) {
         for (size_t b = 0; b < cursors.size(); ++b) {
             auto& c = cursors[b];
             auto& lst = lists[b];
-            if (c.cur != nullptr) {
+            if (lst.tail != nullptr) {
                 uint32_t last_cnt = static_cast<uint32_t>(cap_per_slab - static_cast<size_t>(c.end - c.cur));
-                lst.counts.back() = last_cnt;
+                lst.tail->count = last_cnt;
                 uint32_t tot = 0;
-                for (uint32_t cnt : lst.counts) tot += cnt;
+                for (SlabHeader* h = lst.head; h != nullptr; h = h->next) tot += h->count;
                 lst.total_count = tot;
                 c.cur = nullptr;
                 c.end = nullptr;
@@ -1272,42 +1380,50 @@ struct BucketSet {
         }
     }
 
-    void finish_all(SlabArena&) { finish_all(); }
-
     void recycle_bucket(size_t b, SlabArena& arena) {
         auto& lst = lists[b];
-        for (T* p : lst.slabs) arena.recycle(p);
-        lst.slabs.clear();
-        lst.counts.clear();
+        SlabHeader* h = lst.head;
+        while (h) {
+            SlabHeader* nxt = h->next;
+            arena.recycle(h);
+            h = nxt;
+        }
+        lst.head = nullptr;
+        lst.tail = nullptr;
         lst.total_count = 0;
     }
 };
 
-// Write-combining L1-staged BucketSet for 16B/32B records: flushes 64B cache lines via NT stores on x86_64!
-template <typename T>
+// Multi-line Write-Combining L2-staged BucketSet on x86_64: flushes WC_LINES*64B via NT stores!
+template <typename T, size_t WC_LINES>
 struct StagedBucketSet {
-    static constexpr uint32_t WC_CAP = 64 / sizeof(T);
-    static_assert(sizeof(T) * WC_CAP == 64);
+    static constexpr size_t WC_BYTES = WC_LINES * 64;
+    static constexpr uint32_t WC_CAP = static_cast<uint32_t>(WC_BYTES / sizeof(T));
+    static_assert(sizeof(T) * WC_CAP == WC_BYTES);
 
     T* wc_buf = nullptr;
     std::vector<uint8_t> wc_cnt;
     std::vector<SlabCursor<T>> cursors;
-    std::vector<SlabList<T>> lists;
+    std::vector<SlabChain> lists;
     uint32_t cap_per_slab = WC_CAP;
 
+    StagedBucketSet() = default;
+    StagedBucketSet(const StagedBucketSet&) = delete;
+    StagedBucketSet& operator=(const StagedBucketSet&) = delete;
     ~StagedBucketSet() {
         std::free(wc_buf);
     }
 
     void init(size_t nb, size_t sb) {
-        cap_per_slab = static_cast<uint32_t>(std::max<size_t>(WC_CAP, ((sb / sizeof(T)) / WC_CAP) * WC_CAP));
+        size_t avail = (sb > sizeof(SlabHeader)) ? (sb - sizeof(SlabHeader)) : WC_BYTES;
+        cap_per_slab = static_cast<uint32_t>(std::max<size_t>(WC_CAP, ((avail / sizeof(T)) / WC_CAP) * WC_CAP));
         std::free(wc_buf);
         void* p = nullptr;
-        if (posix_memalign(&p, 64, nb * 64) != 0) p = std::malloc(nb * 64);
+        if (posix_memalign(&p, 64, nb * WC_BYTES) != 0) p = std::malloc(nb * WC_BYTES);
         wc_buf = static_cast<T*>(p);
         wc_cnt.assign(nb, 0);
         cursors.assign(nb, SlabCursor<T>{nullptr, nullptr});
-        lists.resize(nb);
+        lists.assign(nb, SlabChain{});
     }
 
     __attribute__((noinline))
@@ -1315,10 +1431,14 @@ struct StagedBucketSet {
         auto& c = cursors[b];
         if (__builtin_expect(c.cur == c.end, 0)) {
             auto& lst = lists[b];
-            if (c.cur != nullptr) lst.counts.back() = cap_per_slab;
-            T* p = static_cast<T*>(arena.alloc());
-            lst.slabs.push_back(p);
-            lst.counts.push_back(0);
+            if (lst.tail != nullptr) lst.tail->count = cap_per_slab;
+            SlabHeader* h = arena.alloc();
+            h->next = nullptr;
+            h->count = 0;
+            if (lst.tail) lst.tail->next = h;
+            else lst.head = h;
+            lst.tail = h;
+            T* p = reinterpret_cast<T*>(h + 1);
             c.cur = p;
             c.end = p + cap_per_slab;
         }
@@ -1326,10 +1446,11 @@ struct StagedBucketSet {
 #if defined(__AVX2__)
         auto* d = reinterpret_cast<__m256i*>(c.cur);
         const auto* s = reinterpret_cast<const __m256i*>(src);
-        _mm256_stream_si256(d, _mm256_load_si256(s));
-        _mm256_stream_si256(d + 1, _mm256_load_si256(s + 1));
+        for (size_t k = 0; k < WC_LINES * 2; ++k) {
+            _mm256_stream_si256(d + k, _mm256_load_si256(s + k));
+        }
 #else
-        std::memcpy(c.cur, src, 64);
+        std::memcpy(c.cur, src, WC_BYTES);
 #endif
         c.cur += WC_CAP;
         wc_cnt[b] = 0;
@@ -1352,10 +1473,14 @@ struct StagedBucketSet {
             auto& lst = lists[b];
             if (rem > 0) {
                 if (c.cur == c.end) {
-                    if (c.cur != nullptr) lst.counts.back() = cap_per_slab;
-                    T* p = static_cast<T*>(arena.alloc());
-                    lst.slabs.push_back(p);
-                    lst.counts.push_back(0);
+                    if (lst.tail != nullptr) lst.tail->count = cap_per_slab;
+                    SlabHeader* h = arena.alloc();
+                    h->next = nullptr;
+                    h->count = 0;
+                    if (lst.tail) lst.tail->next = h;
+                    else lst.head = h;
+                    lst.tail = h;
+                    T* p = reinterpret_cast<T*>(h + 1);
                     c.cur = p;
                     c.end = p + cap_per_slab;
                 }
@@ -1363,11 +1488,11 @@ struct StagedBucketSet {
                 c.cur += rem;
                 wc_cnt[b] = 0;
             }
-            if (c.cur != nullptr) {
+            if (lst.tail != nullptr) {
                 uint32_t last_cnt = static_cast<uint32_t>(cap_per_slab - static_cast<size_t>(c.end - c.cur));
-                lst.counts.back() = last_cnt;
+                lst.tail->count = last_cnt;
                 uint32_t tot = 0;
-                for (uint32_t cnt : lst.counts) tot += cnt;
+                for (SlabHeader* h = lst.head; h != nullptr; h = h->next) tot += h->count;
                 lst.total_count = tot;
                 c.cur = nullptr;
                 c.end = nullptr;
@@ -1380,96 +1505,92 @@ struct StagedBucketSet {
 
     void recycle_bucket(size_t b, SlabArena& arena) {
         auto& lst = lists[b];
-        for (T* p : lst.slabs) arena.recycle(p);
-        lst.slabs.clear();
-        lst.counts.clear();
+        SlabHeader* h = lst.head;
+        while (h) {
+            SlabHeader* nxt = h->next;
+            arena.recycle(h);
+            h = nxt;
+        }
+        lst.head = nullptr;
+        lst.tail = nullptr;
         lst.total_count = 0;
     }
 };
 
-// Use NT-staged write-combining on x86_64 AVX2/AVX-512, direct stores on ARM64 (avoids double stores!).
+// Use multi-line NT write-combining on x86_64 AVX2/AVX-512, direct stores on ARM64!
 #if defined(__AVX2__)
-template <typename T>
-using FastBucketSet = StagedBucketSet<T>;
+template <typename T, size_t WC_LINES>
+using FastBucketSet = StagedBucketSet<T, WC_LINES>;
 #else
-template <typename T>
+template <typename T, size_t WC_LINES>
 using FastBucketSet = BucketSet<T>;
 #endif
 
-// SOA BucketSet for short/exotic events: eids[cap] + 16B-aligned EvPay[cap] per 32KB slab.
-struct EvSlabCursor {
-    uint8_t* raw = nullptr;
-    uint32_t cnt = 0;
-    uint32_t cap = 0;
-};
+// Zero-malloc per-thread, per-bucket purchase metadata store (bump-carves 2KB blocks from 2MB THP chunks!)
+struct PurchStore {
+    struct Bucket {
+        uint32_t* data = nullptr;
+        uint32_t cnt = 0;
+        uint32_t cap = 0;
+        bool owned = false;
+    };
+    std::vector<Bucket> buckets;
+    uint32_t* bump_cur = nullptr;
+    size_t bump_rem = 0;
+    size_t block_elems = 512;
 
-struct EvSlabList {
-    std::vector<uint8_t*> slabs;
-    std::vector<uint32_t> counts;
-    uint32_t total_count = 0;
-};
+    PurchStore() = default;
+    PurchStore(const PurchStore&) = delete;
+    PurchStore& operator=(const PurchStore&) = delete;
+    ~PurchStore() {
+        for (auto& b : buckets) {
+            if (b.owned) std::free(b.data);
+        }
+    }
 
-struct EvBucketSet {
-    std::vector<EvSlabCursor> cursors;
-    std::vector<EvSlabList> lists;
-    uint32_t cap_per_slab = 2;
-    size_t pay_byte_off = 16;
-
-    void init(size_t nb, size_t sb) {
-        cap_per_slab = static_cast<uint32_t>(std::max<size_t>(2, (sb / 24) & ~static_cast<size_t>(1)));
-        pay_byte_off = static_cast<size_t>(cap_per_slab) * sizeof(uint64_t);
-        cursors.assign(nb, EvSlabCursor{nullptr, 0, 0});
-        lists.resize(nb);
+    void init(size_t nb) {
+        for (auto& b : buckets) {
+            if (b.owned) std::free(b.data);
+        }
+        buckets.assign(nb, Bucket{});
+        bump_cur = nullptr;
+        bump_rem = 0;
+        block_elems = (nb <= 64) ? 256 : 512;
     }
 
     __attribute__((noinline))
-    void alloc_next(size_t b, SlabArena& arena) {
-        auto& lst = lists[b];
-        auto& c = cursors[b];
-        if (c.raw != nullptr) {
-            lst.counts.back() = cap_per_slab;
-        }
-        uint8_t* p = static_cast<uint8_t*>(arena.alloc());
-        lst.slabs.push_back(p);
-        lst.counts.push_back(0);
-        c.raw = p;
-        c.cnt = 0;
-        c.cap = cap_per_slab;
-    }
-
-    FAST_ALWAYS_INLINE void push(size_t b, uint64_t eid, uint64_t uid, uint64_t meta, SlabArena& arena) {
-        auto& c = cursors[b];
-        if (__builtin_expect(c.cnt == c.cap, 0)) {
-            alloc_next(b, arena);
-        }
-        uint32_t idx = c.cnt++;
-        reinterpret_cast<uint64_t*>(c.raw)[idx] = eid;
-        reinterpret_cast<EvPay*>(c.raw + pay_byte_off)[idx] = EvPay{uid, meta};
-    }
-
-    void finish_all() {
-        for (size_t b = 0; b < cursors.size(); ++b) {
-            auto& c = cursors[b];
-            auto& lst = lists[b];
-            if (c.raw != nullptr) {
-                lst.counts.back() = c.cnt;
-                uint32_t tot = 0;
-                for (uint32_t cnt : lst.counts) tot += cnt;
-                lst.total_count = tot;
-                c.raw = nullptr;
-                c.cnt = 0;
-                c.cap = 0;
+    void grow_bucket(Bucket& b) {
+        if (b.data == nullptr) {
+            if (__builtin_expect(bump_rem < block_elems, 0)) {
+                size_t chunk_bytes = (buckets.size() <= 64) ? (256 * 1024) : (2 * 1024 * 1024);
+                bump_cur = static_cast<uint32_t*>(alloc_huge_raw(chunk_bytes));
+                bump_rem = chunk_bytes / sizeof(uint32_t);
             }
+            b.data = bump_cur;
+            bump_cur += block_elems;
+            bump_rem -= block_elems;
+            b.cap = static_cast<uint32_t>(block_elems);
+            b.owned = false;
+            return;
         }
+        uint32_t ncap = std::min<uint32_t>(32768U, b.cap * 2U);
+        uint32_t* np = static_cast<uint32_t*>(std::malloc(static_cast<size_t>(ncap) * sizeof(uint32_t)));
+        std::memcpy(np, b.data, static_cast<size_t>(b.cnt) * sizeof(uint32_t));
+        if (b.owned) std::free(b.data);
+        b.data = np;
+        b.cap = ncap;
+        b.owned = true;
     }
 
-    void recycle_bucket(size_t b, SlabArena& arena) {
-        auto& lst = lists[b];
-        for (uint8_t* p : lst.slabs) arena.recycle(p);
-        lst.slabs.clear();
-        lst.counts.clear();
-        lst.total_count = 0;
+    FAST_ALWAYS_INLINE uint32_t push(size_t b, uint32_t val) {
+        auto& bk = buckets[b];
+        if (__builtin_expect(bk.cnt == bk.cap, 0)) grow_bucket(bk);
+        bk.data[bk.cnt] = val;
+        return ++bk.cnt;
     }
+
+    FAST_ALWAYS_INLINE uint32_t size(size_t b) const { return buckets[b].cnt; }
+    FAST_ALWAYS_INLINE const uint32_t* ptr(size_t b) const { return buckets[b].data; }
 };
 
 // ============================================================================
@@ -1490,7 +1611,7 @@ bool parse_manifest(const std::string& path, int64_t& window_start, int64_t& win
         if (q1 == std::string_view::npos) return false;
         size_t q2 = text.find('"', q1 + 1);
         if (q2 == std::string_view::npos) return false;
-        return fast::parse_timestamp_ms(text.data() + q1 + 1, q2 - q1 - 1, dtab, out);
+        return fast::parse_timestamp_ms(text.data() + q1 + 1, q2 - q1 - 1, dtab, out, text.data() + text.size());
     };
     return extract("\"window_start\"", window_start) && extract("\"window_end\"", window_end);
 }
@@ -1636,6 +1757,7 @@ struct LinkEdge64 {
 void parse_links_and_build_identity_single(const InputFile* link_files,
                                            size_t n_link_files,
                                            size_t total_link_bytes,
+                                           bool use_populate,
                                            KeyEnv& kenv,
                                            LongUserCollector& col,
                                            IdentityMap64& id_map,
@@ -1650,7 +1772,7 @@ void parse_links_and_build_identity_single(const InputFile* link_files,
     std::vector<char> io_buf;
     auto chunks = build_read_chunks(link_files, n_link_files, 1 << 20);
     for (const auto& ch : chunks) {
-        auto sv = get_aligned_chunk(link_files[ch.file_idx], ch, io_buf);
+        auto sv = get_aligned_chunk(link_files[ch.file_idx], ch, io_buf, use_populate);
         if (sv.empty()) continue;
         const char* sv_end = sv.data() + sv.size();
         fast::scan_csv_chunk<2>(sv.data(), sv.size(), [&](const fast::Field (&f)[2]) __attribute__((always_inline)) {
@@ -1671,15 +1793,13 @@ void parse_links_and_build_identity_single(const InputFile* link_files,
     struct DsuSlot { uint64_t key; uint32_t parent; uint32_t pad; };
     static_assert(sizeof(DsuSlot) == 16);
     size_t cap = next_pow2(std::max<size_t>(64, total_edges * 3));
-    DsuSlot* table = static_cast<DsuSlot*>(alloc_huge_raw(cap * sizeof(DsuSlot)));
-    std::memset(table, 0, cap * sizeof(DsuSlot));
+    DsuSlot* table = static_cast<DsuSlot*>(alloc_huge_zeroed(cap * sizeof(DsuSlot)));
     size_t mask = cap - 1;
     size_t num_nodes = 0;
 
     auto grow_table = [&]() {
         size_t ncap = cap * 2;
-        DsuSlot* nt = static_cast<DsuSlot*>(alloc_huge_raw(ncap * sizeof(DsuSlot)));
-        std::memset(nt, 0, ncap * sizeof(DsuSlot));
+        DsuSlot* nt = static_cast<DsuSlot*>(alloc_huge_zeroed(ncap * sizeof(DsuSlot)));
         size_t nmask = ncap - 1;
         std::vector<uint32_t> remap(cap, 0);
         for (size_t i = 0; i < cap; ++i) {
@@ -1748,10 +1868,11 @@ void parse_links_and_build_identity_single(const InputFile* link_files,
     for (size_t i = 0; i < cap; ++i) {
         uint64_t k = table[i].key;
         if (!k) continue;
-        uint32_t r = find_r(static_cast<uint32_t>(i));
-        if (r != static_cast<uint32_t>(i)) {
-            pairs.push_back(IdentityMap64::Pair{k, table[r].key});
-        }
+        uint32_t p = table[i].parent;
+        if (p == static_cast<uint32_t>(i)) continue;
+        uint32_t r = find_r(p);
+        table[i].parent = r;
+        pairs.push_back(IdentityMap64::Pair{k, table[r].key});
     }
     id_map.build_single_from_pairs(pairs.data(), pairs.size());
     ms_idmap = elapsed_sec(t2) * 1000.0;
@@ -2094,32 +2215,60 @@ struct ClickItem {
     uint64_t cid;
 };
 
-static inline bool click_less(const ClickItem& a, const ClickItem& b, const KeyEnv& kenv) {
+struct ClickIdEnv {
+    const InputFile* click_files = nullptr;
+    const KeyEnv* kenv = nullptr;
+    bool use_file_ref = false;
+
+    inline std::string_view get_ref_sv(uint64_t cref) const {
+        uint32_t len = static_cast<uint32_t>((cref >> 40) & 0xFFFU);
+        if (__builtin_expect(len != 0xFFFU, 1)) {
+            uint32_t fi = static_cast<uint32_t>(cref >> 52);
+            size_t off = static_cast<size_t>(cref & 0xFFFFFFFFFFULL);
+            return std::string_view(click_files[fi].mapped.load(std::memory_order_relaxed) + off, len);
+        }
+        return kenv->exotic.get_unlocked((cref & 0xFFFFFFFFFFULL) << 8);
+    }
+
+    inline bool id_less(uint64_t a, uint64_t b, uint32_t camp_a, uint32_t camp_b) const {
+        if (__builtin_expect(use_file_ref, 1)) {
+            if (a == b) return false;
+            std::string_view sa = get_ref_sv(a);
+            std::string_view sb = get_ref_sv(b);
+            return fast::cmp_bytes(sa.data(), sa.size(), sb.data(), sb.size()) < 0;
+        }
+        if (__builtin_expect(a == b, 0)) {
+            if (fast::is_hex_key(a) && camp_a != camp_b) {
+                kenv->long_users.need_exact.store(true, std::memory_order_relaxed);
+            }
+            return false;
+        }
+        return kenv->key_less(a, b, 'k');
+    }
+};
+
+static inline bool click_less(const ClickItem& a, const ClickItem& b, const ClickIdEnv& cenv) {
     uint64_t ta = a.ts_camp >> 20;
     uint64_t tb = b.ts_camp >> 20;
     if (__builtin_expect(ta != tb, 1)) return ta < tb;
-    if (__builtin_expect(a.cid == b.cid, 0)) {
-        if (fast::is_hex_key(a.cid) && (a.ts_camp & 0xFFFFFU) != (b.ts_camp & 0xFFFFFU)) {
-            kenv.long_users.need_exact.store(true, std::memory_order_relaxed);
-        }
-        return false;
-    }
     // Larger click_id FIRST on tie, so the LAST qualifying click at ts has the SMALLEST click_id!
-    return kenv.key_less(b.cid, a.cid, 'k');
+    return cenv.id_less(b.cid, a.cid,
+                        static_cast<uint32_t>(b.ts_camp & 0xFFFFFU),
+                        static_cast<uint32_t>(a.ts_camp & 0xFFFFFU));
 }
 
-static const ClickItem* sort_clicks(ClickItem* a, size_t n, const KeyEnv& kenv,
+static const ClickItem* sort_clicks(ClickItem* a, size_t n, const ClickIdEnv& cenv,
                                     std::vector<ClickItem>& tmp) {
     if (n <= 1) return a;
     if (n == 2) {
-        if (click_less(a[1], a[0], kenv)) std::swap(a[0], a[1]);
+        if (click_less(a[1], a[0], cenv)) std::swap(a[0], a[1]);
         return a;
     }
     if (n <= 24) {
         for (size_t i = 1; i < n; ++i) {
             ClickItem key = a[i];
             size_t j = i;
-            while (j > 0 && click_less(key, a[j - 1], kenv)) {
+            while (j > 0 && click_less(key, a[j - 1], cenv)) {
                 a[j] = a[j - 1];
                 --j;
             }
@@ -2158,29 +2307,37 @@ static const ClickItem* sort_clicks(ClickItem* a, size_t n, const KeyEnv& kenv,
                 for (size_t i = 0; i < n; ++i) dst[cnt[(src[i].ts_camp >> sh) & 255U]++] = src[i];
                 std::swap(src, dst);
             }
-            // Fix any equal-timestamp runs: larger click_id first so smallest click_id is last!
+            // Fix any equal-timestamp runs with >=2 distinct campaigns: place smallest click_id at i - 1!
             for (size_t i = 1; i < n; ++i) {
                 if (__builtin_expect((src[i - 1].ts_camp >> 20) == (src[i].ts_camp >> 20), 0)) {
                     size_t st = i - 1;
                     uint64_t t0 = src[st].ts_camp >> 20;
-                    while (i < n && (src[i].ts_camp >> 20) == t0) ++i;
-                    std::sort(src + st, src + i, [&](const ClickItem& x, const ClickItem& y) {
-                        if (x.cid == y.cid) {
-                            if (fast::is_hex_key(x.cid) && (x.ts_camp & 0xFFFFFU) != (y.ts_camp & 0xFFFFFU)) {
-                                kenv.long_users.need_exact.store(true, std::memory_order_relaxed);
-                            }
-                            return false;
-                        }
-                        return kenv.key_less(y.cid, x.cid, 'k');
-                    });
-                    if (__builtin_expect(fast::is_hex_key(src[i - 1].cid), 0)) {
-                        uint64_t wcid = src[i - 1].cid;
-                        uint32_t wcamp = static_cast<uint32_t>(src[i - 1].ts_camp & 0xFFFFFU);
-                        for (size_t z = st; z + 1 < i; ++z) {
-                            if (src[z].cid == wcid && static_cast<uint32_t>(src[z].ts_camp & 0xFFFFFU) != wcamp) {
-                                kenv.long_users.need_exact.store(true, std::memory_order_relaxed);
+                    uint32_t camp0 = static_cast<uint32_t>(src[st].ts_camp & 0xFFFFFU);
+                    bool mixed = false;
+                    while (i < n && (src[i].ts_camp >> 20) == t0) {
+                        mixed |= (static_cast<uint32_t>(src[i].ts_camp & 0xFFFFFU) != camp0);
+                        ++i;
+                    }
+                    if (__builtin_expect(mixed, 0)) {
+                        size_t best = st;
+                        for (size_t z = st + 1; z < i; ++z) {
+                            if (cenv.id_less(src[z].cid, src[best].cid,
+                                             static_cast<uint32_t>(src[z].ts_camp & 0xFFFFFU),
+                                             static_cast<uint32_t>(src[best].ts_camp & 0xFFFFFU))) {
+                                best = z;
                             }
                         }
+                        if (__builtin_expect(!cenv.use_file_ref && fast::is_hex_key(src[best].cid), 0)) {
+                            uint64_t wcid = src[best].cid;
+                            uint32_t wcamp = static_cast<uint32_t>(src[best].ts_camp & 0xFFFFFU);
+                            for (size_t z = st; z < i; ++z) {
+                                if (z != best && src[z].cid == wcid &&
+                                    static_cast<uint32_t>(src[z].ts_camp & 0xFFFFFU) != wcamp) {
+                                    cenv.kenv->long_users.need_exact.store(true, std::memory_order_relaxed);
+                                }
+                            }
+                        }
+                        if (best != i - 1) std::swap(src[best], src[i - 1]);
                     }
                 }
             }
@@ -2188,7 +2345,7 @@ static const ClickItem* sort_clicks(ClickItem* a, size_t n, const KeyEnv& kenv,
         }
     }
     std::sort(a, a + n, [&](const ClickItem& x, const ClickItem& y) {
-        return click_less(x, y, kenv);
+        return click_less(x, y, cenv);
     });
     return a;
 }
@@ -2272,7 +2429,10 @@ struct UserDailyWriter {
             if (__builtin_expect(has_prev_uid && prev_uid_len > 0 && ulen > 0 && prev_uid_buf[0] == uid[0], 1)) {
                 size_t m = std::min(prev_uid_len, ulen);
                 pre = 1;
-                while (pre < m && prev_uid_buf[pre] == uid[pre]) ++pre;
+                if (__builtin_expect(m > 1 && prev_uid_buf[1] == uid[1], 0)) {
+                    pre = 2;
+                    while (pre < m && prev_uid_buf[pre] == uid[pre]) ++pre;
+                }
             }
             size_t suflen = ulen - pre;
             uid_pre[i] = static_cast<int32_t>(pre);
@@ -2493,6 +2653,11 @@ bool write_campaign_daily(const std::string& path, const Catalogs& cat, const Ca
 
 int main(int argc, char** argv) {
     auto t_total = Clock::now();
+#if defined(__linux__) && defined(__GLIBC__)
+    mallopt(M_MMAP_THRESHOLD, 32 * 1024 * 1024);
+    mallopt(M_TRIM_THRESHOLD, -1);
+    mallopt(M_TOP_PAD, 32 * 1024 * 1024);
+#endif
 
     const char* env_data = std::getenv("DATA_DIR");
     const char* env_out = std::getenv("OUTPUT_DIR");
@@ -2503,6 +2668,9 @@ int main(int argc, char** argv) {
     const char* env_huge = std::getenv("HUGE");
     const char* env_exact = std::getenv("EXACT_LONG");
     const char* env_rel = std::getenv("RELEASE_MAP");
+    const char* env_buckets = std::getenv("BUCKETS");
+    const char* env_parts = std::getenv("PARTS");
+    const char* env_slab = std::getenv("SLAB_BYTES");
 
     std::string data_dir = env_data ? env_data : ((argc >= 3) ? argv[argc - 2] : "/data");
     std::string out_dir = env_out ? env_out : ((argc >= 3) ? argv[argc - 1] : "/output");
@@ -2510,7 +2678,7 @@ int main(int argc, char** argv) {
     bool use_mmap = env_mmap ? (std::atoi(env_mmap) != 0) : true;
     bool use_prefetch = env_pf ? (std::atoi(env_pf) != 0) : false;
     (void)use_prefetch;
-    bool use_populate = env_pop ? (std::atoi(env_pop) != 0) : false;
+    bool use_populate = env_pop ? (std::atoi(env_pop) != 0) : true;
     if (env_huge) g_use_huge = (std::atoi(env_huge) != 0);
 
     ensure_dir(out_dir);
@@ -2592,13 +2760,36 @@ int main(int argc, char** argv) {
 
     size_t num_buckets = (total_event_bytes < 4 * 1024 * 1024)
                              ? 16
-                             : ((total_event_bytes >= 1536ULL * 1024 * 1024) ? 512 : 256);
-    unsigned bucket_shift = (num_buckets == 16) ? 60U : ((num_buckets == 512) ? 55U : 56U);
+                             : ((total_event_bytes < 256ULL * 1024 * 1024)
+                                    ? 256
+                                    : ((total_event_bytes < 3500ULL * 1024 * 1024) ? 1024 : 2048));
     size_t num_parts = (total_event_bytes < 4 * 1024 * 1024)
                            ? 16
-                           : ((total_event_bytes >= 256ULL * 1024 * 1024) ? 256 : 128);
-    unsigned part_shift = (num_parts == 16) ? 60U : ((num_parts == 256) ? 56U : 57U);
-    size_t slab_bytes = (total_event_bytes < 4 * 1024 * 1024) ? 4096 : 32768;
+                           : ((total_event_bytes < 256ULL * 1024 * 1024)
+                                  ? 256
+                                  : ((total_event_bytes < 3500ULL * 1024 * 1024) ? 512 : 1024));
+    if (env_buckets) {
+        size_t v = static_cast<size_t>(std::atoi(env_buckets));
+        if (v >= 16 && (v & (v - 1)) == 0) num_buckets = v;
+    }
+    if (env_parts) {
+        size_t v = static_cast<size_t>(std::atoi(env_parts));
+        if (v >= 16 && (v & (v - 1)) == 0) num_parts = v;
+    }
+    size_t num_long_buckets = std::max<size_t>(16, num_buckets >> 2);
+    unsigned bucket_shift = static_cast<unsigned>(64 - __builtin_ctzll(num_buckets));
+    unsigned long_bucket_shift = static_cast<unsigned>(64 - __builtin_ctzll(num_long_buckets));
+    unsigned part_shift = static_cast<unsigned>(64 - __builtin_ctzll(num_parts));
+    size_t slab_bytes = (total_event_bytes < 4 * 1024 * 1024) ? 4096 : 16384;
+    if (env_slab) {
+        size_t v = static_cast<size_t>(std::atoi(env_slab));
+        if (v >= 4096 && (v & (v - 1)) == 0) slab_bytes = v;
+    }
+    size_t arena_chunk = (total_event_bytes < 4 * 1024 * 1024)
+                             ? 65536
+                             : ((total_event_bytes < 256ULL * 1024 * 1024)
+                                    ? (16ULL << 20)
+                                    : ((total_event_bytes < 3500ULL * 1024 * 1024) ? (128ULL << 20) : (320ULL << 20)));
 
     KeyEnv kenv;
     kenv.long_users.exact_mode = (env_exact && std::atoi(env_exact) != 0);
@@ -2661,25 +2852,24 @@ int main(int argc, char** argv) {
     }
 #endif
 
-    // Stage 1: Overlapped links+DSU + 4KB block-classified SIMD events & clicks!
+    // Stage 1: Overlapped links+DSU + SIMD events & clicks + pre-mapped virtual SlabArenas!
     auto t_s1 = Clock::now();
     auto event_chunks = build_read_chunks(event_files.get(), n_ev_files, READ_CHUNK_SIZE);
     auto click_chunks = build_read_chunks(click_files.get(), n_cl_files, READ_CHUNK_SIZE);
 
     std::vector<SlabArena> arenas(num_threads);
-    std::vector<EvBucketSet> ev_buckets(num_threads);
-    std::vector<FastBucketSet<LongEv32>> long_ev_buckets(num_threads);
-    std::vector<std::vector<std::vector<uint32_t>>> ev_purchases(num_threads);
+    auto ev_buckets = std::make_unique<FastBucketSet<Ev24, 3>[]>(num_threads);
+    auto long_ev_buckets = std::make_unique<FastBucketSet<LongEv32, 2>[]>(num_threads);
+    auto ev_purchases = std::make_unique<PurchStore[]>(num_threads);
     std::vector<std::vector<std::vector<WideEvRow>>> wide_ev_buckets(num_threads);
-    std::vector<BucketSet<PersonClick>> person_cl(num_threads);
+    auto person_cl = std::make_unique<FastBucketSet<PersonClick, 3>[]>(num_threads);
+    bool prealloc_arenas = (total_event_bytes >= 4 * 1024 * 1024);
     for (size_t t = 0; t < num_threads; ++t) {
-        arenas[t].init(slab_bytes, (total_event_bytes < 4 * 1024 * 1024) ? 65536 : 4 * 1024 * 1024);
-        ev_buckets[t].init(num_buckets, slab_bytes);
-        long_ev_buckets[t].init(num_buckets, slab_bytes);
-        ev_purchases[t].resize(num_buckets);
-        wide_ev_buckets[t].resize(num_buckets);
-        person_cl[t].init(num_parts, slab_bytes);
+        arenas[t].init(slab_bytes, arena_chunk, prealloc_arenas);
     }
+
+    bool use_click_ref = use_mmap && (n_cl_files < 4096);
+    ClickIdEnv cid_env{click_files.get(), &kenv, use_click_ref};
 
     std::atomic<size_t> next_ec{0};
     std::atomic<size_t> next_cc{0};
@@ -2711,28 +2901,51 @@ int main(int argc, char** argv) {
             auto sv = get_aligned_chunk(cf, ch, io_buf, use_populate);
             if (sv.empty()) continue;
             const char* sv_end = sv.data() + sv.size();
+            const char* cf_mp = use_click_ref ? cf.mapped.load(std::memory_order_relaxed) : nullptr;
+            const uint64_t fi_tag = static_cast<uint64_t>(ch.file_idx) << 52;
 
             fast::scan_csv_chunk<4>(sv.data(), sv.size(), [&](const fast::Field (&f)[4]) __attribute__((always_inline)) {
                 if (__builtin_expect(f[0].len == 0 || f[1].len == 0 || f[2].len == 0, 0)) return;
                 uint32_t camp_id = catalogs.lookup_campaign(f[2].ptr, f[2].len);
                 if (__builtin_expect(camp_id == 0, 0)) return;
                 int64_t ts_ms = 0;
-                if (__builtin_expect(!fast::parse_timestamp_ms(f[3].ptr, f[3].len, dtab, ts_ms), 0)) return;
+                if (__builtin_expect(!fast::parse_timestamp_ms(f[3].ptr, f[3].len, dtab, ts_ms, sv_end), 0)) return;
                 uint64_t ts_off = static_cast<uint64_t>(ts_ms - click_start);
                 if (__builtin_expect(ts_ms < click_start || ts_off >= cl_span_u64, 0)) return;
 
                 b_uid[nb] = kenv.encode_user(f[1].ptr, f[1].len, sv_end, col);
-                b_cid[nb] = kenv.encode_click(f[0].ptr, f[0].len, sv_end);
+                if (__builtin_expect(use_click_ref, 1)) {
+                    if (__builtin_expect(cf_mp != nullptr && f[0].len < 4095, 1)) {
+                        size_t off = static_cast<size_t>(f[0].ptr - cf_mp);
+                        if (__builtin_expect(off < (1ULL << 40), 1)) {
+                            b_cid[nb] = fi_tag | (static_cast<uint64_t>(f[0].len) << 40) | static_cast<uint64_t>(off);
+                        } else {
+                            uint64_t ek = kenv.exotic.intern(f[0].ptr, f[0].len);
+                            b_cid[nb] = (0xFFFULL << 40) | ((ek >> 8) & 0xFFFFFFFFFFULL);
+                        }
+                    } else {
+                        uint64_t ek = kenv.exotic.intern(f[0].ptr, f[0].len);
+                        b_cid[nb] = (0xFFFULL << 40) | ((ek >> 8) & 0xFFFFFFFFFFULL);
+                    }
+                } else {
+                    b_cid[nb] = kenv.encode_click(f[0].ptr, f[0].len, sv_end);
+                }
                 b_tc[nb] = (ts_off << 20) | camp_id;
                 if (__builtin_expect(++nb == 64, 0)) flush_batch();
             });
-            if (use_mmap && use_release_map) release_mmap_slice(cf.mapped.load(std::memory_order_relaxed), sv);
+            if (use_mmap && use_release_map && !use_click_ref) release_mmap_slice(cf.mapped.load(std::memory_order_relaxed), sv);
         }
         if (nb > 0) flush_batch();
     };
 
     auto scan_events_body = [&](size_t tid) {
         auto tev0 = Clock::now();
+        ev_buckets[tid].init(num_buckets, slab_bytes);
+        long_ev_buckets[tid].init(num_long_buckets, slab_bytes);
+        ev_purchases[tid].init(num_buckets);
+        wide_ev_buckets[tid].resize(num_buckets);
+        person_cl[tid].init(num_parts, slab_bytes);
+
         std::vector<char> io_buf;
         if (!use_mmap) io_buf.reserve(READ_CHUNK_SIZE + 8192);
         auto& my_ev = ev_buckets[tid];
@@ -2773,7 +2986,7 @@ int main(int argc, char** argv) {
                 } else if (__builtin_expect(f[0].len == 33 && f[0].ptr[0] == 'e' &&
                                             fast::parse_hex128(f[0].ptr + 1, eid, eid_lo), 1)) {
                     is_long_eid = true;
-                    bucket = static_cast<size_t>(fast::hash_u128(eid, eid_lo) >> bucket_shift);
+                    bucket = static_cast<size_t>(fast::hash_u128(eid, eid_lo) >> long_bucket_shift);
                 } else {
                     eid = kenv.exotic.intern(f[0].ptr, f[0].len);
                     bucket = static_cast<size_t>(fast::hash_u64(eid) >> bucket_shift);
@@ -2799,7 +3012,7 @@ int main(int argc, char** argv) {
 
                     if (__builtin_expect(etype != 0, 1)) {
                         if (__builtin_expect(fast::parse_timestamp_ms_sec(f[2].ptr, f[2].len, dtab, ts_ms, ts_sec,
-                                                                          ingest_ym, ingest_dd, ingest_day_sec), 1)) {
+                                                                          sv_end, ingest_ym, ingest_dd, ingest_day_sec), 1)) {
                             ts_off_u64 = static_cast<uint64_t>(ts_ms - window_start);
                             if (__builtin_expect(ts_ms >= window_start && ts_off_u64 < ev_span_u64 &&
                                                      (ingest_ms - ts_ms) <= DAY_MS, 1)) {
@@ -2816,7 +3029,7 @@ int main(int argc, char** argv) {
 
                 if (__builtin_expect(!valid, 0)) {
                     if (__builtin_expect(!is_long_eid, 1)) {
-                        my_ev.push(bucket, eid, 0ULL, static_cast<uint64_t>(ingest_sec), arena);
+                        my_ev.push(bucket, Ev24{eid, 0ULL, static_cast<uint64_t>(ingest_sec)}, arena);
                     } else {
                         my_lev.push(bucket, LongEv32{eid, eid_lo, 0ULL, static_cast<uint64_t>(ingest_sec)}, arena);
                     }
@@ -2827,18 +3040,16 @@ int main(int argc, char** argv) {
                 if (__builtin_expect(compact_ev_mode, 1)) {
                     uint32_t ts_off = static_cast<uint32_t>(ts_off_u64);
                     int64_t delta = ingest_sec - ts_sec;
-                    auto& pv = my_purch[bucket];
                     if (__builtin_expect(delta >= -65536 && delta <= 196607 &&
-                                             (price_cents == 0 || pv.size() < 32767), 1)) {
+                                             (price_cents == 0 || my_purch.size(bucket) < 32767), 1)) {
                         uint32_t pidx_p1 = 0;
                         if (__builtin_expect(price_cents > 0, 0)) {
-                            pv.push_back((cat_id << 24) | price_cents);
-                            pidx_p1 = static_cast<uint32_t>(pv.size());
+                            pidx_p1 = my_purch.push(bucket, (cat_id << 24) | price_cents);
                         }
                         uint64_t d_biased = static_cast<uint64_t>(delta + 65536);
                         uint64_t meta = (static_cast<uint64_t>(ts_off) << 33) | (d_biased << 15) | pidx_p1;
                         if (__builtin_expect(!is_long_eid, 1)) {
-                            my_ev.push(bucket, eid, uid, meta, arena);
+                            my_ev.push(bucket, Ev24{eid, uid, meta}, arena);
                         } else {
                             my_lev.push(bucket, LongEv32{eid, eid_lo, uid, meta}, arena);
                         }
@@ -2849,7 +3060,7 @@ int main(int argc, char** argv) {
             });
             if (use_mmap && use_release_map) release_mmap_slice(ef.mapped.load(std::memory_order_relaxed), sv);
         }
-        my_ev.finish_all();
+        my_ev.finish_all(arena);
         my_lev.finish_all(arena);
         auto tcl0 = Clock::now();
         prof_s1_ev_ns.fetch_add(
@@ -2871,7 +3082,7 @@ int main(int argc, char** argv) {
         if (overlap_dsu && tid == 0) {
             auto td = Clock::now();
             parse_links_and_build_identity_single(link_files.get(), n_ln_files, total_link_bytes,
-                                                  kenv, long_collectors[0], identity_map,
+                                                  use_populate, kenv, long_collectors[0], identity_map,
                                                   dsu_parse_ms, dsu_union_ms, dsu_idmap_ms);
             dsu_ms = elapsed_sec(td) * 1000.0;
             identity_ready.store(1U, std::memory_order_release);
@@ -2891,7 +3102,7 @@ int main(int argc, char** argv) {
             scan_clicks_for(tid, io_buf);
         });
     }
-    for (size_t t = 0; t < num_threads; ++t) person_cl[t].finish_all();
+    for (size_t t = 0; t < num_threads; ++t) person_cl[t].finish_all(arenas[t]);
 
     auto t_vlu = Clock::now();
     if (!kenv.long_users.verify_and_build(long_collectors, team, num_threads)) {
@@ -2913,14 +3124,10 @@ int main(int argc, char** argv) {
                  prof_s1_ev_ns.load() / (1e6 * num_threads),
                  prof_s1_cl_ns.load() / (1e6 * num_threads));
 
-    // Stage 2: SOA L2-Bitmap Pre-Filter Dedup + L1-Bitmap LongEv32 Dedup + Batch-64 Fast Emit!
+    // Stage 2: L1/L2-Bitmap Pre-Filter Dedup on Ev24 + LongEv32 + 4-Line WC Emit + 100% Slab Recycling!
     auto t_s2 = Clock::now();
-    std::vector<FastBucketSet<PersonEv16>> person_ev(num_threads);
+    auto person_ev = std::make_unique<FastBucketSet<PersonEv16, 4>[]>(num_threads);
     std::vector<std::vector<std::vector<WidePersonEv>>> wide_person_ev(num_threads);
-    for (size_t t = 0; t < num_threads; ++t) {
-        person_ev[t].init(num_parts, slab_bytes);
-        wide_person_ev[t].resize(num_parts);
-    }
 
     std::atomic<size_t> next_db{0};
     std::atomic<bool> has_any_wide{false};
@@ -2928,8 +3135,10 @@ int main(int argc, char** argv) {
 
     team.run([&](size_t tid) {
         if (tid >= num_threads) return;
+        person_ev[tid].init(num_parts, slab_bytes);
+        wide_person_ev[tid].resize(num_parts);
+
         auto& arena = arenas[tid];
-        const size_t pay_off = ev_buckets[0].pay_byte_off;
         struct DedupSlot {
             uint32_t tag;
             uint32_t loc;
@@ -2961,7 +3170,7 @@ int main(int argc, char** argv) {
 
         // Fallback full-table buffers (only used when bucket has WideEvRow!)
         std::vector<DedupSlot> full_table;
-        std::vector<uint8_t*> slab_ptrs;
+        std::vector<SlabHeader*> slab_ptrs;
         std::vector<WideEvRow*> wide_ptrs;
 
         auto& my_ev = person_ev[tid];
@@ -2996,7 +3205,7 @@ int main(int argc, char** argv) {
             size_t total_recs = 0, total_long = 0, total_wide = 0;
             for (size_t t = 0; t < num_threads; ++t) {
                 total_recs += ev_buckets[t].lists[b].total_count;
-                total_long += long_ev_buckets[t].lists[b].total_count;
+                if (b < num_long_buckets) total_long += long_ev_buckets[t].lists[b].total_count;
                 total_wide += wide_ev_buckets[t][b].size();
             }
             if (total_recs + total_long + total_wide == 0) continue;
@@ -3004,7 +3213,7 @@ int main(int argc, char** argv) {
 
             auto tp1 = Clock::now();
             if (__builtin_expect(total_wide == 0, 1)) {
-                // FAST PATH (99.999%): SOA Bitmap Pre-Filter for short/exotic events!
+                // FAST PATH (99.999%): L1/L2-Resident Bitmap Pre-Filter for Ev24!
                 if (total_recs > 0) {
                     size_t nbits = next_pow2(std::max<size_t>(64, total_recs * 16));
                     size_t nwords = nbits >> 6;
@@ -3020,13 +3229,12 @@ int main(int argc, char** argv) {
                     uint64_t h_ring[16];
 
                     for (size_t t = 0; t < num_threads; ++t) {
-                        const auto& lst = ev_buckets[t].lists[b];
-                        for (size_t si = 0; si < lst.slabs.size(); ++si) {
-                            const uint64_t* eids = reinterpret_cast<const uint64_t*>(lst.slabs[si]);
-                            uint32_t cnt = lst.counts[si];
+                        for (SlabHeader* hdr = ev_buckets[t].lists[b].head; hdr != nullptr; hdr = hdr->next) {
+                            const Ev24* arr = reinterpret_cast<const Ev24*>(hdr + 1);
+                            uint32_t cnt = hdr->count;
                             uint32_t pre = std::min<uint32_t>(8, cnt);
                             for (uint32_t j = 0; j < pre; ++j) {
-                                uint64_t nh = fast::hash_u64(eids[j]);
+                                uint64_t nh = fast::hash_u64(arr[j].eid);
                                 h_ring[j] = nh;
                                 size_t nw = static_cast<size_t>((nh & fmask) >> 6);
                                 __builtin_prefetch(&sb[nw], 1, 1);
@@ -3035,7 +3243,7 @@ int main(int argc, char** argv) {
                             for (uint32_t i = 0; i < cnt; ++i) {
                                 uint64_t f = h_ring[i & 15] & fmask;
                                 if (__builtin_expect(i + 8 < cnt, 1)) {
-                                    uint64_t nh = fast::hash_u64(eids[i + 8]);
+                                    uint64_t nh = fast::hash_u64(arr[i + 8].eid);
                                     h_ring[(i + 8) & 15] = nh;
                                     size_t nw = static_cast<size_t>((nh & fmask) >> 6);
                                     __builtin_prefetch(&sb[nw], 1, 1);
@@ -3071,39 +3279,37 @@ int main(int argc, char** argv) {
                     };
 
                     for (size_t t = 0; t < num_threads; ++t) {
-                        const auto& lst = ev_buckets[t].lists[b];
-                        const auto& pv = ev_purchases[t][b];
-                        for (size_t si = 0; si < lst.slabs.size(); ++si) {
-                            const uint64_t* eids = reinterpret_cast<const uint64_t*>(lst.slabs[si]);
-                            const EvPay* pays = reinterpret_cast<const EvPay*>(lst.slabs[si] + pay_off);
-                            uint32_t cnt = lst.counts[si];
+                        const uint32_t* pv = ev_purchases[t].ptr(b);
+                        for (SlabHeader* hdr = ev_buckets[t].lists[b].head; hdr != nullptr; hdr = hdr->next) {
+                            const Ev24* arr = reinterpret_cast<const Ev24*>(hdr + 1);
+                            uint32_t cnt = hdr->count;
                             uint32_t pre = std::min<uint32_t>(8, cnt);
                             for (uint32_t j = 0; j < pre; ++j) {
-                                uint64_t nh = fast::hash_u64(eids[j]);
+                                uint64_t nh = fast::hash_u64(arr[j].eid);
                                 h_ring[j] = nh;
                                 __builtin_prefetch(&cb[static_cast<size_t>((nh & fmask) >> 6)], 0, 1);
                             }
                             for (uint32_t i = 0; i < cnt; ++i) {
                                 uint64_t h = h_ring[i & 15];
                                 if (__builtin_expect(i + 8 < cnt, 1)) {
-                                    uint64_t nh = fast::hash_u64(eids[i + 8]);
+                                    uint64_t nh = fast::hash_u64(arr[i + 8].eid);
                                     h_ring[(i + 8) & 15] = nh;
                                     __builtin_prefetch(&cb[static_cast<size_t>((nh & fmask) >> 6)], 0, 1);
                                 }
                                 uint64_t f = h & fmask;
                                 if (__builtin_expect((cb[f >> 6] & (1ULL << (f & 63U))) == 0, 1)) {
-                                    uint64_t uid = pays[i].uid;
+                                    uint64_t uid = arr[i].uid;
                                     if (__builtin_expect(uid == 0, 0)) continue;
-                                    uint64_t meta = pays[i].meta;
+                                    uint64_t meta = arr[i].meta;
                                     uint32_t pidx = static_cast<uint32_t>(meta & 0x7FFFU);
                                     uint32_t pc = __builtin_expect(pidx == 0, 1) ? 0U : pv[pidx - 1];
                                     b_uid[nb] = uid;
                                     b_tspc[nb] = ((meta >> 33) << 32) | pc;
                                     if (__builtin_expect(++nb == 64, 0)) flush_ev_batch();
                                 } else {
-                                    uint64_t eid = eids[i];
-                                    uint64_t uid = pays[i].uid;
-                                    uint64_t meta = pays[i].meta;
+                                    uint64_t eid = arr[i].eid;
+                                    uint64_t uid = arr[i].uid;
+                                    uint64_t meta = arr[i].meta;
                                     size_t sl = static_cast<size_t>(h) & dmask;
                                     while (true) {
                                         uint32_t cur = dup_ht[sl];
@@ -3137,7 +3343,7 @@ int main(int argc, char** argv) {
                     for (const auto& de : dup_entries) {
                         if (de.uid == 0) continue;
                         uint32_t pidx = static_cast<uint32_t>(de.meta & 0x7FFFU);
-                        uint32_t pc = (pidx == 0) ? 0U : ev_purchases[de.owner_t][b][pidx - 1];
+                        uint32_t pc = (pidx == 0) ? 0U : ev_purchases[de.owner_t].ptr(b)[pidx - 1];
                         b_uid[nb] = de.uid;
                         b_tspc[nb] = ((de.meta >> 33) << 32) | pc;
                         if (__builtin_expect(++nb == 64, 0)) flush_ev_batch();
@@ -3161,10 +3367,9 @@ int main(int argc, char** argv) {
                     uint64_t* lcb = l_coll_bits.data();
 
                     for (size_t t = 0; t < num_threads; ++t) {
-                        const auto& lst = long_ev_buckets[t].lists[b];
-                        for (size_t si = 0; si < lst.slabs.size(); ++si) {
-                            const LongEv32* arr = lst.slabs[si];
-                            uint32_t cnt = lst.counts[si];
+                        for (SlabHeader* hdr = long_ev_buckets[t].lists[b].head; hdr != nullptr; hdr = hdr->next) {
+                            const LongEv32* arr = reinterpret_cast<const LongEv32*>(hdr + 1);
+                            uint32_t cnt = hdr->count;
                             for (uint32_t i = 0; i < cnt; ++i) {
                                 uint64_t f = fast::hash_u128(arr[i].hi, arr[i].lo) & lfmask;
                                 size_t w = static_cast<size_t>(f >> 6);
@@ -3193,11 +3398,10 @@ int main(int argc, char** argv) {
                     };
 
                     for (size_t t = 0; t < num_threads; ++t) {
-                        const auto& lst = long_ev_buckets[t].lists[b];
-                        const auto& pv = ev_purchases[t][b];
-                        for (size_t si = 0; si < lst.slabs.size(); ++si) {
-                            const LongEv32* arr = lst.slabs[si];
-                            uint32_t cnt = lst.counts[si];
+                        const uint32_t* pv = ev_purchases[t].ptr(b);
+                        for (SlabHeader* hdr = long_ev_buckets[t].lists[b].head; hdr != nullptr; hdr = hdr->next) {
+                            const LongEv32* arr = reinterpret_cast<const LongEv32*>(hdr + 1);
+                            uint32_t cnt = hdr->count;
                             for (uint32_t i = 0; i < cnt; ++i) {
                                 uint64_t hi = arr[i].hi;
                                 uint64_t lo = arr[i].lo;
@@ -3247,7 +3451,7 @@ int main(int argc, char** argv) {
                     for (const auto& ls : l_dup_entries) {
                         if (ls.uid == 0) continue;
                         uint32_t pidx = static_cast<uint32_t>(ls.meta & 0x7FFFU);
-                        uint32_t pc = (pidx == 0) ? 0U : ev_purchases[ls.owner_t][b][pidx - 1];
+                        uint32_t pc = (pidx == 0) ? 0U : ev_purchases[ls.owner_t].ptr(b)[pidx - 1];
                         b_uid[nb] = ls.uid;
                         b_tspc[nb] = ((ls.meta >> 33) << 32) | pc;
                         if (__builtin_expect(++nb == 64, 0)) flush_ev_batch();
@@ -3264,37 +3468,32 @@ int main(int argc, char** argv) {
                 wide_ptrs.clear();
 
                 auto get_slot_eid = [&](uint32_t loc) -> uint64_t {
-                    if ((loc & 0x80000000U) == 0) return reinterpret_cast<const uint64_t*>(slab_ptrs[(loc >> 12) - 1])[loc & 0xFFFU];
+                    if ((loc & 0x80000000U) == 0) return reinterpret_cast<const Ev24*>(slab_ptrs[(loc >> 12) - 1] + 1)[loc & 0xFFFU].eid;
                     return wide_ptrs[loc & 0x7FFFFFFFU]->eid;
                 };
                 auto get_slot_ingest = [&](uint32_t loc) -> int64_t {
                     if ((loc & 0x80000000U) == 0) {
-                        const EvPay* pays = reinterpret_cast<const EvPay*>(slab_ptrs[(loc >> 12) - 1] + pay_off);
-                        const auto& r = pays[loc & 0xFFFU];
+                        const auto& r = reinterpret_cast<const Ev24*>(slab_ptrs[(loc >> 12) - 1] + 1)[loc & 0xFFFU];
                         return get_ev_ingest(r.uid, r.meta);
                     }
                     return wide_ptrs[loc & 0x7FFFFFFFU]->ingest_sec;
                 };
                 auto kill_slot = [&](uint32_t loc) {
                     if ((loc & 0x80000000U) == 0) {
-                        EvPay* pays = reinterpret_cast<EvPay*>(slab_ptrs[(loc >> 12) - 1] + pay_off);
-                        pays[loc & 0xFFFU].uid = 0;
+                        reinterpret_cast<Ev24*>(slab_ptrs[(loc >> 12) - 1] + 1)[loc & 0xFFFU].uid = 0;
                     } else {
                         wide_ptrs[loc & 0x7FFFFFFFU]->uid = 0;
                     }
                 };
 
                 for (size_t t = 0; t < num_threads; ++t) {
-                    auto& lst = ev_buckets[t].lists[b];
-                    for (size_t si = 0; si < lst.slabs.size(); ++si) {
-                        uint8_t* raw = lst.slabs[si];
-                        const uint64_t* eids = reinterpret_cast<const uint64_t*>(raw);
-                        EvPay* pays = reinterpret_cast<EvPay*>(raw + pay_off);
-                        uint32_t cnt = lst.counts[si];
+                    for (SlabHeader* hdr = ev_buckets[t].lists[b].head; hdr != nullptr; hdr = hdr->next) {
+                        Ev24* arr = reinterpret_cast<Ev24*>(hdr + 1);
+                        uint32_t cnt = hdr->count;
                         uint32_t sidx_p1 = static_cast<uint32_t>(slab_ptrs.size()) + 1;
-                        slab_ptrs.push_back(raw);
+                        slab_ptrs.push_back(hdr);
                         for (uint32_t i = 0; i < cnt; ++i) {
-                            uint64_t eid = eids[i];
+                            uint64_t eid = arr[i].eid;
                             uint64_t h = fast::hash_u64(eid);
                             uint32_t tag = static_cast<uint32_t>(h >> 23);
                             size_t slot = static_cast<size_t>(h) & mask;
@@ -3306,13 +3505,13 @@ int main(int argc, char** argv) {
                                     break;
                                 }
                                 if (ds.tag == tag && get_slot_eid(ds.loc) == eid) {
-                                    int64_t cur_ing = get_ev_ingest(pays[i].uid, pays[i].meta);
+                                    int64_t cur_ing = get_ev_ingest(arr[i].uid, arr[i].meta);
                                     int64_t prev_ing = get_slot_ingest(ds.loc);
                                     if (cur_ing < prev_ing) {
                                         kill_slot(ds.loc);
                                         ds.loc = (sidx_p1 << 12) | i;
                                     } else {
-                                        pays[i].uid = 0;
+                                        arr[i].uid = 0;
                                     }
                                     break;
                                 }
@@ -3360,38 +3559,39 @@ int main(int argc, char** argv) {
                 std::vector<LongWideRef> long_wide_refs(lcap, LongWideRef{false, nullptr, 0});
                 long_used.clear();
 
-                for (size_t t = 0; t < num_threads; ++t) {
-                    const auto& lst = long_ev_buckets[t].lists[b];
-                    for (size_t si = 0; si < lst.slabs.size(); ++si) {
-                        const LongEv32* arr = lst.slabs[si];
-                        uint32_t cnt = lst.counts[si];
-                        for (uint32_t i = 0; i < cnt; ++i) {
-                            size_t sl = static_cast<size_t>(fast::hash_u128(arr[i].hi, arr[i].lo)) & lmask;
-                            while (true) {
-                                auto& ls = long_ht[sl];
-                                if (!ls.used) {
-                                    int64_t ing = get_ev_ingest(arr[i].uid, arr[i].meta);
-                                    ls = LongSlot{arr[i].hi, arr[i].lo, arr[i].uid, arr[i].meta,
-                                                  static_cast<uint32_t>(t), 1};
-                                    long_wide_refs[sl] = {false, nullptr, ing};
-                                    long_used.push_back(static_cast<uint32_t>(sl));
-                                    break;
-                                }
-                                if (ls.hi == arr[i].hi && ls.lo == arr[i].lo) {
-                                    int64_t ing = get_ev_ingest(arr[i].uid, arr[i].meta);
-                                    if (ing < long_wide_refs[sl].ing) {
-                                        ls.uid = arr[i].uid;
-                                        ls.meta = arr[i].meta;
-                                        ls.owner_t = static_cast<uint32_t>(t);
+                if (b < num_long_buckets) {
+                    for (size_t t = 0; t < num_threads; ++t) {
+                        for (SlabHeader* hdr = long_ev_buckets[t].lists[b].head; hdr != nullptr; hdr = hdr->next) {
+                            const LongEv32* arr = reinterpret_cast<const LongEv32*>(hdr + 1);
+                            uint32_t cnt = hdr->count;
+                            for (uint32_t i = 0; i < cnt; ++i) {
+                                size_t sl = static_cast<size_t>(fast::hash_u128(arr[i].hi, arr[i].lo)) & lmask;
+                                while (true) {
+                                    auto& ls = long_ht[sl];
+                                    if (!ls.used) {
+                                        int64_t ing = get_ev_ingest(arr[i].uid, arr[i].meta);
+                                        ls = LongSlot{arr[i].hi, arr[i].lo, arr[i].uid, arr[i].meta,
+                                                      static_cast<uint32_t>(t), 1};
                                         long_wide_refs[sl] = {false, nullptr, ing};
+                                        long_used.push_back(static_cast<uint32_t>(sl));
+                                        break;
                                     }
-                                    break;
+                                    if (ls.hi == arr[i].hi && ls.lo == arr[i].lo) {
+                                        int64_t ing = get_ev_ingest(arr[i].uid, arr[i].meta);
+                                        if (ing < long_wide_refs[sl].ing) {
+                                            ls.uid = arr[i].uid;
+                                            ls.meta = arr[i].meta;
+                                            ls.owner_t = static_cast<uint32_t>(t);
+                                            long_wide_refs[sl] = {false, nullptr, ing};
+                                        }
+                                        break;
+                                    }
+                                    sl = (sl + 1) & lmask;
                                 }
-                                sl = (sl + 1) & lmask;
                             }
                         }
+                        long_ev_buckets[t].recycle_bucket(b, arena);
                     }
-                    long_ev_buckets[t].recycle_bucket(b, arena);
                 }
                 for (size_t t = 0; t < num_threads; ++t) {
                     for (auto& wr : wide_ev_buckets[t][b]) {
@@ -3419,17 +3619,16 @@ int main(int argc, char** argv) {
 
                 // Emit all survivors
                 for (size_t t = 0; t < num_threads; ++t) {
-                    const auto& lst = ev_buckets[t].lists[b];
-                    const auto& pv = ev_purchases[t][b];
-                    for (size_t si = 0; si < lst.slabs.size(); ++si) {
-                        const EvPay* pays = reinterpret_cast<const EvPay*>(lst.slabs[si] + pay_off);
-                        uint32_t cnt = lst.counts[si];
+                    const uint32_t* pv = ev_purchases[t].ptr(b);
+                    for (SlabHeader* hdr = ev_buckets[t].lists[b].head; hdr != nullptr; hdr = hdr->next) {
+                        const Ev24* arr = reinterpret_cast<const Ev24*>(hdr + 1);
+                        uint32_t cnt = hdr->count;
                         for (uint32_t i = 0; i < cnt; ++i) {
-                            if (pays[i].uid == 0) continue;
-                            uint64_t meta = pays[i].meta;
+                            if (arr[i].uid == 0) continue;
+                            uint64_t meta = arr[i].meta;
                             uint32_t pidx = static_cast<uint32_t>(meta & 0x7FFFU);
                             uint32_t pc = (pidx == 0) ? 0U : pv[pidx - 1];
-                            b_uid[nb] = pays[i].uid;
+                            b_uid[nb] = arr[i].uid;
                             b_tspc[nb] = ((meta >> 33) << 32) | pc;
                             if (++nb == 64) flush_ev_batch();
                         }
@@ -3454,7 +3653,7 @@ int main(int argc, char** argv) {
                             WidePersonEv{pid, wr.ts_ms, wr.price_cents, wr.cat_id});
                     } else {
                         uint32_t pidx = static_cast<uint32_t>(ls.meta & 0x7FFFU);
-                        uint32_t pc = (pidx == 0) ? 0U : ev_purchases[ls.owner_t][b][pidx - 1];
+                        uint32_t pc = (pidx == 0) ? 0U : ev_purchases[ls.owner_t].ptr(b)[pidx - 1];
                         b_uid[nb] = ls.uid;
                         b_tspc[nb] = ((ls.meta >> 33) << 32) | pc;
                         if (++nb == 64) flush_ev_batch();
@@ -3528,8 +3727,8 @@ int main(int argc, char** argv) {
             uint32_t mx;
             uint32_t cnt;
             uint32_t sid;
-            int64_t rev;
         };
+        static_assert(sizeof(Bucket30) == 16);
 
         std::vector<UserSlot> utable;
         std::vector<uint64_t> u_pids;
@@ -3546,7 +3745,7 @@ int main(int argc, char** argv) {
             uint16_t cid;
             uint32_t price;
         };
-        std::vector<Bucket30> bag(can_bucket_sess ? num_30m_buckets : 1, Bucket30{0, 0, 0, 0, 0});
+        std::vector<Bucket30> bag(can_bucket_sess ? num_30m_buckets : 1, Bucket30{0, 0, 0, 0});
         std::vector<uint16_t> touched_bks;
         touched_bks.reserve(can_bucket_sess ? num_30m_buckets : 1);
         std::vector<PurEv> pur_evs;
@@ -3582,7 +3781,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            size_t est_users = std::max<size_t>(32, total_ev / 24);
+            size_t est_users = std::clamp<size_t>(total_ev / 24, 32, 2048);
             size_t ucap = next_pow2(est_users * 2);
             if (utable.size() < ucap) utable.resize(ucap);
             std::memset(utable.data(), 0, ucap * sizeof(UserSlot));
@@ -3642,10 +3841,9 @@ int main(int argc, char** argv) {
                 uint64_t h_ring[16];
 
                 for (size_t t = 0; t < num_threads; ++t) {
-                    const auto& lst = person_ev[t].lists[p];
-                    for (size_t si = 0; si < lst.slabs.size(); ++si) {
-                        const PersonEv16* arr = lst.slabs[si];
-                        uint32_t cnt = lst.counts[si];
+                    for (SlabHeader* hdr = person_ev[t].lists[p].head; hdr != nullptr; hdr = hdr->next) {
+                        const PersonEv16* arr = reinterpret_cast<const PersonEv16*>(hdr + 1);
+                        uint32_t cnt = hdr->count;
                         uint32_t pre = std::min<uint32_t>(8, cnt);
                         for (uint32_t j = 0; j < pre; ++j) {
                             uint64_t nh = fast::hash_u64(arr[j].pid);
@@ -3675,11 +3873,22 @@ int main(int argc, char** argv) {
                 uint32_t* cur = ev_cur.data();
                 size_t k = 0;
                 for (size_t t = 0; t < num_threads; ++t) {
-                    const auto& lst = person_ev[t].lists[p];
-                    for (size_t si = 0; si < lst.slabs.size(); ++si) {
-                        const PersonEv16* arr = lst.slabs[si];
-                        uint32_t cnt = lst.counts[si];
-                        for (uint32_t i = 0; i < cnt; ++i) {
+                    for (SlabHeader* hdr = person_ev[t].lists[p].head; hdr != nullptr; hdr = hdr->next) {
+                        const PersonEv16* arr = reinterpret_cast<const PersonEv16*>(hdr + 1);
+                        uint32_t cnt = hdr->count;
+                        uint32_t i = 0;
+                        // Loads-before-stores batch of 8 (2.2x faster under container SSBD mitigation!)
+                        for (; i + 8 <= cnt; i += 8, k += 8) {
+                            uint32_t u0 = uid_out[k],     u1 = uid_out[k + 1], u2 = uid_out[k + 2], u3 = uid_out[k + 3];
+                            uint32_t u4 = uid_out[k + 4], u5 = uid_out[k + 5], u6 = uid_out[k + 6], u7 = uid_out[k + 7];
+                            uint64_t v0 = arr[i].ts_pc,     v1 = arr[i + 1].ts_pc, v2 = arr[i + 2].ts_pc, v3 = arr[i + 3].ts_pc;
+                            uint64_t v4 = arr[i + 4].ts_pc, v5 = arr[i + 5].ts_pc, v6 = arr[i + 6].ts_pc, v7 = arr[i + 7].ts_pc;
+                            uint32_t p0 = cur[u0]++; uint32_t p1 = cur[u1]++; uint32_t p2 = cur[u2]++; uint32_t p3 = cur[u3]++;
+                            uint32_t p4 = cur[u4]++; uint32_t p5 = cur[u5]++; uint32_t p6 = cur[u6]++; uint32_t p7 = cur[u7]++;
+                            dst[p0] = v0; dst[p1] = v1; dst[p2] = v2; dst[p3] = v3;
+                            dst[p4] = v4; dst[p5] = v5; dst[p6] = v6; dst[p7] = v7;
+                        }
+                        for (; i < cnt; ++i) {
                             dst[cur[uid_out[k++]]++] = arr[i].ts_pc;
                         }
                     }
@@ -3690,10 +3899,9 @@ int main(int argc, char** argv) {
                 tmp_ev_uid.reserve(total_ev);
                 tmp_wev.reserve(total_ev);
                 for (size_t t = 0; t < num_threads; ++t) {
-                    const auto& lst = person_ev[t].lists[p];
-                    for (size_t si = 0; si < lst.slabs.size(); ++si) {
-                        const PersonEv16* arr = lst.slabs[si];
-                        uint32_t cnt = lst.counts[si];
+                    for (SlabHeader* hdr = person_ev[t].lists[p].head; hdr != nullptr; hdr = hdr->next) {
+                        const PersonEv16* arr = reinterpret_cast<const PersonEv16*>(hdr + 1);
+                        uint32_t cnt = hdr->count;
                         for (uint32_t i = 0; i < cnt; ++i) {
                             uint32_t uid = get_or_add_user(arr[i].pid);
                             u_ev_cnt[uid]++;
@@ -3735,10 +3943,9 @@ int main(int argc, char** argv) {
             uint64_t ch_ring[16];
 
             for (size_t t = 0; t < num_threads; ++t) {
-                const auto& lst = person_cl[t].lists[p];
-                for (size_t si = 0; si < lst.slabs.size(); ++si) {
-                    const PersonClick* arr = lst.slabs[si];
-                    uint32_t cnt = lst.counts[si];
+                for (SlabHeader* hdr = person_cl[t].lists[p].head; hdr != nullptr; hdr = hdr->next) {
+                    const PersonClick* arr = reinterpret_cast<const PersonClick*>(hdr + 1);
+                    uint32_t cnt = hdr->count;
                     uint32_t pre = std::min<uint32_t>(8, cnt);
                     for (uint32_t j = 0; j < pre; ++j) {
                         uint64_t nh = fast::hash_u64(arr[j].pid);
@@ -3773,10 +3980,9 @@ int main(int argc, char** argv) {
             uint32_t* ccur = cl_cur.data();
             size_t ck = 0;
             for (size_t t = 0; t < num_threads; ++t) {
-                const auto& lst = person_cl[t].lists[p];
-                for (size_t si = 0; si < lst.slabs.size(); ++si) {
-                    const PersonClick* arr = lst.slabs[si];
-                    uint32_t cnt = lst.counts[si];
+                for (SlabHeader* hdr = person_cl[t].lists[p].head; hdr != nullptr; hdr = hdr->next) {
+                    const PersonClick* arr = reinterpret_cast<const PersonClick*>(hdr + 1);
+                    uint32_t cnt = hdr->count;
                     for (uint32_t i = 0; i < cnt; ++i) {
                         uint32_t uid = cl_uid_out[ck++];
                         if (__builtin_expect(uid != UINT32_MAX, 1)) {
@@ -3833,7 +4039,6 @@ int main(int argc, char** argv) {
                             a.cnt++;
                             uint32_t price = static_cast<uint32_t>(ev) & 0x00FFFFFFU;
                             if (__builtin_expect(price > 0, 0)) {
-                                a.rev += price;
                                 pur_evs.push_back(PurEv{
                                     static_cast<uint16_t>(bk),
                                     static_cast<uint16_t>(static_cast<uint32_t>(ev) >> 24),
@@ -3856,28 +4061,30 @@ int main(int argc, char** argv) {
                                 }
                                 u_sessions.push_back(SessionRec{
                                     static_cast<uint64_t>(a.mn) + static_cast<uint64_t>(WEEK_MS),
-                                    a.rev, cur_day, static_cast<uint32_t>(cur_day - min_day), a.cnt
+                                    0LL, cur_day, static_cast<uint32_t>(cur_day - min_day), a.cnt
                                 });
                             } else {
-                                auto& last_s = u_sessions.back();
-                                last_s.ev_cnt += a.cnt;
-                                last_s.rev_cents += a.rev;
+                                u_sessions.back().ev_cnt += a.cnt;
                             }
                             a.sid = static_cast<uint32_t>(u_sessions.size() - 1);
                             prev_mx = a.mx;
                         }
                         const size_t npur = pur_evs.size();
                         const int32_t single_pur_cat = (npur == 1) ? static_cast<int32_t>(pur_evs[0].cid) : -1;
-                        if (npur >= 2) {
-                            for (const auto& pe : pur_evs) {
-                                uint32_t day_off = u_sessions[bptr[pe.bk].sid].day_off;
-                                catday_rev[static_cast<size_t>(day_off) * num_cats + pe.cid] += pe.price;
+                        if (__builtin_expect(npur > 0, 0)) {
+                            if (npur == 1) {
+                                const auto& pe = pur_evs[0];
+                                u_sessions[bptr[pe.bk].sid].rev_cents += pe.price;
+                            } else {
+                                for (const auto& pe : pur_evs) {
+                                    auto& s = u_sessions[bptr[pe.bk].sid];
+                                    s.rev_cents += pe.price;
+                                    catday_rev[static_cast<size_t>(s.day_off) * num_cats + pe.cid] += pe.price;
+                                }
                             }
                         }
                         for (size_t k = 0; k < ntb; ++k) {
-                            auto& a = bptr[touched_bks[k]];
-                            a.cnt = 0;
-                            a.rev = 0;
+                            bptr[touched_bks[k]].cnt = 0;
                         }
 
                         // Emit user_daily rows grouped by day!
@@ -4086,11 +4293,7 @@ int main(int argc, char** argv) {
                                         best_camp = camp;
                                     } else if (__builtin_expect(t == best_ts, 0)) {
                                         uint64_t cid = cb_raw[qi].cid;
-                                        if (cid == best_cid) {
-                                            if (fast::is_hex_key(cid) && camp != best_camp) {
-                                                kenv.long_users.need_exact.store(true, std::memory_order_relaxed);
-                                            }
-                                        } else if (kenv.key_less(cid, best_cid, 'k')) {
+                                        if (cid_env.id_less(cid, best_cid, camp, best_camp)) {
                                             best_cid = cid;
                                             best_camp = camp;
                                         }
@@ -4130,11 +4333,7 @@ int main(int argc, char** argv) {
                                         best_camp = camp;
                                     } else if (__builtin_expect(t == best_ts, 0)) {
                                         uint64_t cid = cb_raw[qi].cid;
-                                        if (cid == best_cid) {
-                                            if (fast::is_hex_key(cid) && camp != best_camp) {
-                                                kenv.long_users.need_exact.store(true, std::memory_order_relaxed);
-                                            }
-                                        } else if (kenv.key_less(cid, best_cid, 'k')) {
+                                        if (cid_env.id_less(cid, best_cid, camp, best_camp)) {
                                             best_cid = cid;
                                             best_camp = camp;
                                         }
@@ -4151,7 +4350,7 @@ int main(int argc, char** argv) {
 
                 // Large users & whales: sort clicks (larger click_id first on tie -> last qualifying wins!),
                 // two-pointer credit, and merged per-campaign intervals for O(C log C + C * ndays) assists!
-                const ClickItem* cb = sort_clicks(cb_raw, C, kenv, cl_radix_tmp);
+                const ClickItem* cb = sort_clicks(cb_raw, C, cid_env, cl_radix_tmp);
                 if (__builtin_expect(u_sessions[S - 1].start_cl_off < (cb[0].ts_camp >> 20), 0)) {
                     if (__builtin_expect(fast_dense, 1)) {
                         for (size_t si = 0; si < S; ++si) cacc.add_session_dense(0, u_sessions[si].day_off, u_sessions[si].rev_cents);
@@ -4290,18 +4489,50 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Failed to write campaign_daily\n");
         return 1;
     }
+    double ms_merge = elapsed_sec(t_merge) * 1000.0;
 
-    std::fprintf(stderr, "Stage 3 in %.3fs (avg/thread: grp=%.1fms proc+ud=%.1fms close=%.1fms | merge+cd=%.1fms)\n",
+    double ms_rel = 0.0;
+#if defined(__linux__) && defined(MADV_DONTNEED)
+    // Parallel 64 MiB-chunked MADV_DONTNEED across ALL file mmaps AND huge anonymous regions!
+    // Eliminates single-threaded kernel exit_mmap() teardown of 500K+ PTEs after _exit(0)!
+    if (num_threads > 1 && total_event_bytes >= (64ULL << 20)) {
+        auto t_rel = Clock::now();
+        std::vector<HugeRegion> chunks;
+        chunks.reserve(256);
+        constexpr size_t CH = 64ULL << 20;
+        auto add_reg = [&](const void* p, size_t n) {
+            if (!p || n == 0) return;
+            size_t rn = (n + 4095ULL) & ~size_t(4095ULL);
+            const char* base = static_cast<const char*>(p);
+            for (size_t o = 0; o < rn; o += CH) {
+                chunks.push_back(HugeRegion{const_cast<char*>(base + o), std::min(CH, rn - o)});
+            }
+        };
+        for (size_t i = 0; i < n_ev_files; ++i) add_reg(event_files[i].mapped.load(std::memory_order_relaxed), event_files[i].size);
+        for (size_t i = 0; i < n_cl_files; ++i) add_reg(click_files[i].mapped.load(std::memory_order_relaxed), click_files[i].size);
+        for (size_t i = 0; i < n_ln_files; ++i) add_reg(link_files[i].mapped.load(std::memory_order_relaxed), link_files[i].size);
+        uint32_t nreg = std::min<uint32_t>(g_huge_reg_cnt.load(std::memory_order_relaxed), 4096U);
+        for (uint32_t i = 0; i < nreg; ++i) add_reg(g_huge_regs[i].ptr, g_huge_regs[i].len);
+        std::atomic<size_t> next_rel{0};
+        team.run([&](size_t) {
+            while (true) {
+                size_t idx = next_rel.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= chunks.size()) break;
+                ::madvise(chunks[idx].ptr, chunks[idx].len, MADV_DONTNEED);
+            }
+        });
+        ms_rel = elapsed_sec(t_rel) * 1000.0;
+    }
+#endif
+
+    std::fprintf(stderr, "Stage 3 in %.3fs (avg/thread: grp=%.1fms proc+ud=%.1fms close=%.1fms | merge+cd=%.1fms rel=%.1fms)\n",
                  elapsed_sec(t_s3),
                  prof_grp_ns.load() / (1e6 * num_threads),
                  prof_proc_ns.load() / (1e6 * num_threads),
                  prof_pq_ns.load() / (1e6 * num_threads),
-                 elapsed_sec(t_merge) * 1000.0);
+                 ms_merge, ms_rel);
     std::fprintf(stderr, "Completed pipeline in %.3fs\n", elapsed_sec(t_total));
     std::fflush(stderr);
-#if defined(PGO_TRAIN)
-    return 0;
-#else
+    if (__builtin_expect(std::getenv("PGO_CLEAN_EXIT") != nullptr, 0)) return 0;
     _exit(0);
-#endif
 }

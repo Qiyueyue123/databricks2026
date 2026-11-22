@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string_view>
@@ -195,7 +196,7 @@ static FAST_ALWAYS_INLINE bool parse_hex8(const char* s, uint32_t& out) {
 }
 
 // Parse 32 lowercase hex digits [0-9a-f]{32} into big-endian (hi64, lo64).
-static FAST_ALWAYS_INLINE bool parse_hex128(const char* s, uint64_t& hi, uint64_t& lo) {
+static FAST_ALWAYS_INLINE bool parse_hex128_scalar(const char* s, uint64_t& hi, uint64_t& lo) {
     uint32_t a, b, c, d;
     if (__builtin_expect(parse_hex8(s, a) && parse_hex8(s + 8, b) &&
                          parse_hex8(s + 16, c) && parse_hex8(s + 24, d), 1)) {
@@ -206,12 +207,40 @@ static FAST_ALWAYS_INLINE bool parse_hex128(const char* s, uint64_t& hi, uint64_
     return false;
 }
 
+static FAST_ALWAYS_INLINE bool parse_hex128(const char* s, uint64_t& hi, uint64_t& lo) {
+#if defined(__AVX2__)
+    __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s));
+    __m256i is_dig = _mm256_and_si256(
+        _mm256_cmpgt_epi8(v, _mm256_set1_epi8('0' - 1)),
+        _mm256_cmpgt_epi8(_mm256_set1_epi8('9' + 1), v));
+    __m256i is_af = _mm256_and_si256(
+        _mm256_cmpgt_epi8(v, _mm256_set1_epi8('a' - 1)),
+        _mm256_cmpgt_epi8(_mm256_set1_epi8('f' + 1), v));
+    __m256i ok = _mm256_or_si256(is_dig, is_af);
+    if (__builtin_expect(_mm256_movemask_epi8(ok) != -1, 0)) return false;
+    __m256i sub = _mm256_add_epi8(
+        _mm256_set1_epi8('0'),
+        _mm256_and_si256(is_af, _mm256_set1_epi8('a' - '0' - 10)));
+    __m256i nib = _mm256_sub_epi8(v, sub);
+    __m256i pairs16 = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+    __m128i bytes16 = _mm_packus_epi16(_mm256_castsi256_si128(pairs16),
+                                       _mm256_extracti128_si256(pairs16, 1));
+    uint64_t h_le = static_cast<uint64_t>(_mm_cvtsi128_si64(bytes16));
+    uint64_t l_le = static_cast<uint64_t>(_mm_extract_epi64(bytes16, 1));
+    hi = __builtin_bswap64(h_le);
+    lo = __builtin_bswap64(l_le);
+    return true;
+#else
+    return parse_hex128_scalar(s, hi, lo);
+#endif
+}
+
 static FAST_ALWAYS_INLINE uint64_t make_hex_key(uint64_t hi) {
     return HEX_KEY_TAG | ((hi >> 9) << 8);
 }
 
-// Format 128-bit hex value (pfx + 32 lowercase hex chars = 33 bytes) via 256-entry 2-byte LUT!
-static inline void format_hex128(char pfx, uint64_t hi, uint64_t lo, char* out) {
+// Format 128-bit hex value (pfx + 32 lowercase hex chars = 33 bytes).
+static inline void format_hex128_scalar(char pfx, uint64_t hi, uint64_t lo, char* out) {
     static constexpr char HEX2[513] =
         "000102030405060708090a0b0c0d0e0f"
         "101112131415161718191a1b1c1d1e1f"
@@ -240,6 +269,25 @@ static inline void format_hex128(char pfx, uint64_t hi, uint64_t lo, char* out) 
     }
 }
 
+static inline void format_hex128(char pfx, uint64_t hi, uint64_t lo, char* out) {
+#if defined(__SSSE3__)
+    out[0] = pfx;
+    uint64_t h_le = __builtin_bswap64(hi);
+    uint64_t l_le = __builtin_bswap64(lo);
+    __m128i b = _mm_set_epi64x(static_cast<long long>(l_le), static_cast<long long>(h_le));
+    __m128i mask0f = _mm_set1_epi8(0x0F);
+    __m128i hi_nib = _mm_and_si128(_mm_srli_epi16(b, 4), mask0f);
+    __m128i lo_nib = _mm_and_si128(b, mask0f);
+    __m128i out_lo = _mm_unpacklo_epi8(hi_nib, lo_nib);
+    __m128i out_hi = _mm_unpackhi_epi8(hi_nib, lo_nib);
+    __m128i lut = _mm_setr_epi8('0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f');
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 1),  _mm_shuffle_epi8(lut, out_lo));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out + 17), _mm_shuffle_epi8(lut, out_hi));
+#else
+    format_hex128_scalar(pfx, hi, lo, out);
+#endif
+}
+
 // Extract the known 14-byte prefix (pfx + top 13 hex digits) directly from a fast hex key!
 static inline void format_hex_prefix14(char pfx, uint64_t k, char* out) {
     static constexpr char HEX[17] = "0123456789abcdef";
@@ -254,7 +302,7 @@ static inline void format_hex_prefix14(char pfx, uint64_t k, char* out) {
 // Calendar & Timestamp Parsers
 // ============================================================================
 
-static inline int64_t days_from_civil(int32_t y, uint32_t m, uint32_t d) {
+static constexpr int64_t days_from_civil(int32_t y, uint32_t m, uint32_t d) {
     y -= (m <= 2);
     int32_t era = (y >= 0 ? y : y - 399) / 400;
     uint32_t yoe = static_cast<uint32_t>(y - era * 400);
@@ -433,10 +481,10 @@ static FAST_ALWAYS_INLINE bool parse_ingest_f1_sec(const char* s, size_t len, co
     return true;
 }
 
-// Strict F1 / F2 / F3 timestamp parser returning BOTH ms and sec (ZERO division, register date-hint reuse!).
-static FAST_ALWAYS_INLINE bool parse_timestamp_ms_sec(const char* s, size_t len, const DateTable& dtab,
-                                                      int64_t& out_ms, int64_t& out_sec,
-                                                      uint64_t hint_ym = 0, uint16_t hint_dd = 0, int64_t hint_day_sec = 0) {
+// Strict F1 / F2 / F3 scalar timestamp parser returning BOTH ms and sec (ZERO division, register date-hint reuse!).
+static FAST_ALWAYS_INLINE bool parse_timestamp_ms_sec_scalar(const char* s, size_t len, const DateTable& dtab,
+                                                             int64_t& out_ms, int64_t& out_sec,
+                                                             uint64_t hint_ym = 0, uint16_t hint_dd = 0, int64_t hint_day_sec = 0) {
     if (len == 20 && s[19] == 'Z') {
         if (__builtin_expect(s[10] != 'T', 0)) return false;
         uint32_t hms_sec;
@@ -527,10 +575,152 @@ static FAST_ALWAYS_INLINE bool parse_timestamp_ms_sec(const char* s, size_t len,
     return true;
 }
 
+#if defined(__AVX2__)
+// Compile-time branch-free AVX2 timestamp tables covering ALL 3 formats (F3=13, F1=20, F2=25) with ZERO branch mispredicts!
+struct alignas(32) Avx2TsForm {
+    uint8_t t8[32]{};
+    uint8_t l8[32]{};
+    int8_t wa[32]{};
+    int8_t wb[32]{};
+    uint16_t lo[16]{};
+    uint16_t rg[16]{};
+    int16_t m[16]{};
+};
+
+struct Avx2TsTables {
+    static constexpr uint32_t Y0 = 1900;
+    static constexpr uint32_t NY = 400;
+    Avx2TsForm form[3]{};
+    int32_t ystart[NY + 1]{};
+    int16_t moff[2][16] = {
+        {0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 0, 0, 0},
+        {0, 0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335, 0, 0, 0},
+    };
+    uint8_t mdays[2][16] = {
+        {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0, 0, 0},
+        {0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 0, 0, 0},
+    };
+    uint8_t kind[26] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 3, 3, 3, 3, 3, 3, 1, 3, 3, 3, 3, 2};
+
+    constexpr Avx2TsTables() {
+        for (uint32_t i = 0; i <= NY; ++i) {
+            ystart[i] = static_cast<int32_t>(days_from_civil(static_cast<int32_t>(Y0 + i), 1, 1));
+        }
+        const char* pats[3] = {"DDDDDDDDDDDDD", "DDDD-DD-DDTDD:DD:DDZ", "DDDD-DD-DDTDD:DD:DD+DD:DD"};
+        for (int k = 0; k < 3; ++k) {
+            auto& f = form[k];
+            for (int i = 0; i < 32; ++i) f.l8[i] = 0xFF;
+            for (int i = 0; pats[k][i] != '\0'; ++i) {
+                char c = pats[k][i];
+                f.t8[i] = (c == 'D') ? static_cast<uint8_t>('0') : static_cast<uint8_t>(c);
+                f.l8[i] = (c == 'D') ? 9 : ((c == '+') ? 2 : 0);
+            }
+            for (int i = 0; i < 16; ++i) f.rg[i] = 0xFFFF;
+            if (k == 0) {
+                for (int i = 0; i < 12; i += 2) { f.wa[i] = 10; f.wa[i + 1] = 1; }
+                f.wa[12] = 1;
+                for (int i = 0; i < 6; i += 2) { f.m[i] = 100; f.m[i + 1] = 1; }
+                f.m[6] = 1;
+            } else {
+                const int fa[5] = {0, 1, 4, 7, 10};
+                const int fb[4] = {2, 5, 8, 11};
+                for (int j = 0; j < 5; ++j) { f.wa[2 * fa[j]] = 10; f.wa[2 * fa[j] + 1] = 1; }
+                for (int j = 0; j < 4; ++j) { f.wb[2 * fb[j]] = 10; f.wb[2 * fb[j] + 1] = 1; }
+                f.lo[2] = 1; f.rg[2] = 11;
+                f.lo[4] = 1; f.rg[4] = 30;
+                f.rg[5] = 23; f.rg[7] = 59; f.rg[8] = 59;
+                f.m[0] = 100; f.m[1] = 1; f.m[2] = 1; f.m[4] = 24; f.m[5] = 1; f.m[7] = 60; f.m[8] = 1;
+                if (k == 2) {
+                    f.rg[10] = 23; f.rg[11] = 59;
+                    f.m[10] = 60; f.m[11] = 1;
+                }
+            }
+        }
+    }
+};
+
+static constexpr Avx2TsTables AVX2_TS{};
+
+// Branch-free AVX2 F1/F2/F3 timestamp validator + parser (reads s[0..32] safely via buf_end guard!).
+static FAST_ALWAYS_INLINE bool parse_timestamp_ms_sec(const char* s, size_t len, const DateTable& dtab,
+                                                      int64_t& out_ms, int64_t& out_sec,
+                                                      const char* buf_end,
+                                                      uint64_t hint_ym = 0, uint16_t hint_dd = 0, int64_t hint_day_sec = 0) {
+    unsigned k = (len < 26) ? AVX2_TS.kind[len] : 3U;
+    if (__builtin_expect(k == 3U || s + 33 > buf_end, 0)) {
+        return parse_timestamp_ms_sec_scalar(s, len, dtab, out_ms, out_sec, hint_ym, hint_dd, hint_day_sec);
+    }
+    const Avx2TsForm& f = AVX2_TS.form[k];
+    __m256i x = _mm256_sub_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s)),
+                                _mm256_load_si256(reinterpret_cast<const __m256i*>(f.t8)));
+    __m256i y = _mm256_sub_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 1)),
+                                _mm256_set1_epi8('0'));
+    __m256i l8 = _mm256_load_si256(reinterpret_cast<const __m256i*>(f.l8));
+    __m256i u = _mm256_add_epi16(_mm256_maddubs_epi16(x, _mm256_load_si256(reinterpret_cast<const __m256i*>(f.wa))),
+                                 _mm256_maddubs_epi16(y, _mm256_load_si256(reinterpret_cast<const __m256i*>(f.wb))));
+    __m256i rg = _mm256_load_si256(reinterpret_cast<const __m256i*>(f.rg));
+    __m256i ur = _mm256_sub_epi16(u, _mm256_load_si256(reinterpret_cast<const __m256i*>(f.lo)));
+    __m256i good = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_max_epu8(x, l8), l8),
+                                    _mm256_cmpeq_epi16(_mm256_max_epu16(ur, rg), rg));
+    unsigned bad = static_cast<unsigned>(_mm256_movemask_epi8(good)) != 0xFFFFFFFFU;
+    bad |= static_cast<unsigned>(k == 2U) & static_cast<unsigned>(s[19] == ',');
+
+    __m256i g = _mm256_madd_epi16(u, _mm256_load_si256(reinterpret_cast<const __m256i*>(f.m)));
+    __m128i g0 = _mm256_castsi256_si128(g);
+    uint64_t a = static_cast<uint64_t>(_mm_cvtsi128_si64(g0));
+    uint64_t b = static_cast<uint64_t>(_mm_extract_epi64(g0, 1));
+    uint64_t c = static_cast<uint64_t>(_mm_cvtsi128_si64(_mm256_extracti128_si256(g, 1)));
+    uint32_t g1 = static_cast<uint32_t>(a);
+    uint32_t g2 = static_cast<uint32_t>(a >> 32);
+    uint32_t g3 = static_cast<uint32_t>(b);
+    uint32_t g4 = static_cast<uint32_t>(b >> 32);
+
+    int64_t f3_ms = static_cast<int64_t>(g1) * 1000000000LL +
+                    static_cast<int64_t>(g2) * 100000LL +
+                    static_cast<int64_t>(g3) * 10LL +
+                    static_cast<int64_t>(g4);
+    int64_t f3_sec = static_cast<int64_t>(g1) * 1000000LL +
+                     static_cast<int64_t>(g2) * 100LL +
+                     static_cast<int64_t>(g3 / 100U);
+
+    unsigned cm = -static_cast<unsigned>(k != 0U);
+    unsigned yi = (g1 - Avx2TsTables::Y0) & cm;
+    unsigned out_yr = static_cast<unsigned>(yi >= Avx2TsTables::NY);
+    if (__builtin_expect((out_yr & !bad) != 0U, 0)) {
+        return parse_timestamp_ms_sec_scalar(s, len, dtab, out_ms, out_sec, hint_ym, hint_dd, hint_day_sec);
+    }
+    yi &= (out_yr - 1U);
+    unsigned mo = g2 & 15U;
+    unsigned da = static_cast<unsigned>(_mm256_extract_epi16(u, 4));
+    unsigned leap = static_cast<unsigned>(AVX2_TS.ystart[yi + 1] - AVX2_TS.ystart[yi]) - 365U;
+    bad |= cm & static_cast<unsigned>(da > AVX2_TS.mdays[leap][mo]);
+
+    int64_t hours = static_cast<int64_t>(AVX2_TS.ystart[yi] + AVX2_TS.moff[leap][mo] - 1) * 24LL +
+                    static_cast<int64_t>(g3);
+    int64_t off_sec = static_cast<int64_t>(static_cast<uint32_t>(c >> 32)) * 60LL *
+                      static_cast<int64_t>(1 - ((static_cast<unsigned char>(s[19]) >> 1) & 2));
+    int64_t cal_sec = hours * 3600LL + static_cast<int64_t>(g4) +
+                      static_cast<int64_t>(static_cast<uint32_t>(c)) - off_sec;
+    int64_t cal_ms = cal_sec * 1000LL;
+
+    int64_t km = static_cast<int64_t>(static_cast<int32_t>(cm));
+    out_ms = (cal_ms & km) | (f3_ms & ~km);
+    out_sec = (cal_sec & km) | (f3_sec & ~km);
+    return bad == 0U;
+}
+#else
+static FAST_ALWAYS_INLINE bool parse_timestamp_ms_sec(const char* s, size_t len, const DateTable& dtab,
+                                                      int64_t& out_ms, int64_t& out_sec,
+                                                      const char* /*buf_end*/,
+                                                      uint64_t hint_ym = 0, uint16_t hint_dd = 0, int64_t hint_day_sec = 0) {
+    return parse_timestamp_ms_sec_scalar(s, len, dtab, out_ms, out_sec, hint_ym, hint_dd, hint_day_sec);
+}
+#endif
+
 static FAST_ALWAYS_INLINE bool parse_timestamp_ms(const char* s, size_t len, const DateTable& dtab,
-                                                  int64_t& out_ms) {
+                                                  int64_t& out_ms, const char* buf_end = nullptr) {
     int64_t dummy_sec = 0;
-    return parse_timestamp_ms_sec(s, len, dtab, out_ms, dummy_sec);
+    return parse_timestamp_ms_sec(s, len, dtab, out_ms, dummy_sec, buf_end);
 }
 
 static inline bool parse_price_cents(const char* s, size_t len, uint32_t& out) {
@@ -616,315 +806,46 @@ static inline void scan_csv_chunk_scalar(const char* data, size_t size, Fn&& on_
     }
 }
 
-// Validate & extract N fields from a line of length L < 64 using 64-bit masks (1-carry quote check!).
-template <size_t N>
-static FAST_ALWAYS_INLINE bool extract_line64(const char* line, uint32_t L, uint64_t cm, uint64_t qm, Field (&f)[N]) {
-    const uint64_t keep = (1ULL << L) - 1ULL;
-    cm &= keep;
-    if (__builtin_expect(static_cast<size_t>(__builtin_popcountll(cm)) != N - 1, 0)) return false;
-    qm &= keep;
-    const uint64_t sep = cm | (1ULL << L);
-    const uint64_t body = ~sep & keep;
-    const uint64_t starts = ((sep << 1) | 1ULL) & body;
-    const uint64_t lasts = (sep >> 1) & body;
-    const uint64_t qs = qm & starts;
-    const uint64_t qe = qm & lasts;
-    const uint64_t open = (body + qs) & sep;
-    if (__builtin_expect((qm != (qs | qe)) | ((qs & qe) != 0) | (open != (qe << 1)), 0)) return false;
-    uint32_t s = 0;
-    if constexpr (N == 2) {
-        uint32_t e0 = static_cast<uint32_t>(__builtin_ctzll(cm));
-        uint32_t w0 = static_cast<uint32_t>(line[0] == '"');
-        f[0] = Field{line + w0, e0 - (w0 << 1)};
-        s = e0 + 1;
-        uint32_t w1 = static_cast<uint32_t>(line[s] == '"');
-        f[1] = Field{line + s + w1, (L - s) - (w1 << 1)};
-    } else if constexpr (N == 4) {
-        uint32_t e0 = static_cast<uint32_t>(__builtin_ctzll(cm)); cm &= cm - 1;
-        uint32_t e1 = static_cast<uint32_t>(__builtin_ctzll(cm)); cm &= cm - 1;
-        uint32_t e2 = static_cast<uint32_t>(__builtin_ctzll(cm));
-        uint32_t w0 = static_cast<uint32_t>(line[0] == '"');
-        uint32_t w1 = static_cast<uint32_t>(line[e0 + 1] == '"');
-        uint32_t w2 = static_cast<uint32_t>(line[e1 + 1] == '"');
-        uint32_t w3 = static_cast<uint32_t>(line[e2 + 1] == '"');
-        f[0] = Field{line + w0, e0 - (w0 << 1)};
-        f[1] = Field{line + e0 + 1 + w1, (e1 - e0 - 1) - (w1 << 1)};
-        f[2] = Field{line + e1 + 1 + w2, (e2 - e1 - 1) - (w2 << 1)};
-        f[3] = Field{line + e2 + 1 + w3, (L - e2 - 1) - (w3 << 1)};
-    } else {
-        for (size_t k = 0; k < N; ++k) {
-            uint32_t e;
-            if (k + 1 < N) {
-                e = static_cast<uint32_t>(__builtin_ctzll(cm));
-                cm &= cm - 1;
-            } else {
-                e = L;
-            }
-            uint32_t w = static_cast<uint32_t>(line[s] == '"');
-            f[k] = Field{line + s + w, (e - s) - (w << 1)};
-            s = e + 1;
-        }
+// ============================================================================
+// k6 Streaming-Mask 4KB Segment CSV Scanner:
+// - Out-of-line stage1 gets ALL 16 x86-64 registers (ZERO spills!)
+// - 5-op cross-block exact dialect quote rule (ZERO __uint128_t shifts!)
+// - BMI2 pext/pdep flag-byte stream -> single u64/u32/u16 check per line!
+// - ZERO byte loads for quote stripping, handles lines up to 4096B on fast path!
+// - Leaves >= 64 readable bytes past every scanned block (safe 33B AVX2 loads!)
+// ============================================================================
+
+static constexpr size_t K6_NB = 64;
+static constexpr size_t K6_SEG = K6_NB * 64; // 4096 bytes
+static constexpr size_t K6_CAP = K6_SEG + 64;
+static constexpr size_t K6_NSENT = 16;
+static constexpr uint8_t K6_F_Q = 1;
+static constexpr uint8_t K6_F_NL = 2;
+static constexpr uint8_t K6_F_BAD = 4;
+static constexpr uint64_t K6_L1 = 0x0101010101010101ULL;
+
+struct alignas(64) K6Ring {
+    uint32_t e[K6_CAP];
+    uint8_t fl[K6_CAP];
+};
+
+__attribute__((cold, noinline))
+static size_t k6_block_slow(uint64_t f, uint64_t qs, uint64_t n, uint64_t bad,
+                            uint32_t base, uint32_t* ep, uint8_t* flp) {
+    size_t i = 0;
+    while (f) {
+        uint32_t tz = static_cast<uint32_t>(__builtin_ctzll(f));
+        ep[i] = base + tz;
+        flp[i] = static_cast<uint8_t>(((qs >> tz) & 1ULL) |
+                                      (((n >> tz) & 1ULL) << 1) |
+                                      (((bad >> tz) & 1ULL) << 2));
+        f &= f - 1ULL;
+        ++i;
     }
-    return true;
+    return i;
 }
 
-// Validate & extract N fields from a line of length 1 <= L < 128 using 128-bit masks (1-carry quote check!).
-template <size_t N>
-static FAST_ALWAYS_INLINE bool extract_line128(const char* line, uint32_t L,
-                                               uint64_t c0, uint64_t c1, uint64_t q0, uint64_t q1,
-                                               Field (&f)[N]) {
-    const __uint128_t keep = (static_cast<__uint128_t>(1) << L) - 1;
-    const __uint128_t cm = ((static_cast<__uint128_t>(c1) << 64) | c0) & keep;
-    uint64_t lo = static_cast<uint64_t>(cm);
-    uint64_t hi = static_cast<uint64_t>(cm >> 64);
-    const uint32_t nlo = static_cast<uint32_t>(__builtin_popcountll(lo));
-    const uint32_t nhi = static_cast<uint32_t>(__builtin_popcountll(hi));
-    if (__builtin_expect(nlo + nhi != N - 1, 0)) return false;
-
-    const __uint128_t qm = ((static_cast<__uint128_t>(q1) << 64) | q0) & keep;
-    const __uint128_t sep = cm | (static_cast<__uint128_t>(1) << L);
-    const __uint128_t body = ~sep & keep;
-    const __uint128_t starts = ((sep << 1) | 1) & body;
-    const __uint128_t lasts = (sep >> 1) & body;
-    const __uint128_t qs = qm & starts;
-    const __uint128_t qe = qm & lasts;
-    const __uint128_t open = (body + qs) & sep;
-    if (__builtin_expect((qm != (qs | qe)) | ((qs & qe) != 0) | (open != (qe << 1)), 0)) return false;
-
-    uint32_t cs[N];
-    if constexpr (N == 7) {
-        if (__builtin_expect(nlo >= 3 && nhi >= 1, 1)) {
-            cs[0] = static_cast<uint32_t>(__builtin_ctzll(lo)); lo &= lo - 1;
-            cs[1] = static_cast<uint32_t>(__builtin_ctzll(lo)); lo &= lo - 1;
-            cs[2] = static_cast<uint32_t>(__builtin_ctzll(lo)); lo &= lo - 1;
-            unsigned b5 = 63U - static_cast<unsigned>(__builtin_clzll(hi));
-            cs[5] = 64U + b5;
-            hi ^= (1ULL << b5);
-            for (int k = 3; k <= 4; ++k) {
-                bool u = (lo != 0);
-                uint64_t m = u ? lo : hi;
-                cs[k] = static_cast<uint32_t>(__builtin_ctzll(m)) + (u ? 0U : 64U);
-                lo = u ? (lo & (lo - 1)) : lo;
-                hi = u ? hi : (hi & (hi - 1));
-            }
-        } else {
-            for (size_t k = 0; k < 6; ++k) {
-                bool u = (lo != 0);
-                uint64_t m = u ? lo : hi;
-                cs[k] = static_cast<uint32_t>(__builtin_ctzll(m)) + (u ? 0U : 64U);
-                lo = u ? (lo & (lo - 1)) : lo;
-                hi = u ? hi : (hi & (hi - 1));
-            }
-        }
-    } else {
-        for (size_t k = 0; k < N - 1; ++k) {
-            bool u = (lo != 0);
-            uint64_t m = u ? lo : hi;
-            cs[k] = static_cast<uint32_t>(__builtin_ctzll(m)) + (u ? 0U : 64U);
-            lo = u ? (lo & (lo - 1)) : lo;
-            hi = u ? hi : (hi & (hi - 1));
-        }
-    }
-    cs[N - 1] = L;
-
-    uint32_t s = 0;
-    for (size_t k = 0; k < N; ++k) {
-        uint32_t e = cs[k];
-        uint32_t w = static_cast<uint32_t>(line[s] == '"');
-        f[k] = Field{line + s + w, (e - s) - (w << 1)};
-        s = e + 1;
-    }
-    return true;
-}
-
-// Validate & extract 7 fields from a long Scorer v5 line (128 <= L < 192, e.g. two 33B hex IDs!) from 3 words.
-static inline bool extract_line192_7(const char* line, uint32_t L,
-                                     uint64_t c0, uint64_t c1, uint64_t c2,
-                                     uint64_t q0, uint64_t q1, uint64_t q2,
-                                     Field (&f)[7]) {
-    uint64_t m2 = (1ULL << (L - 128)) - 1ULL;
-    c2 &= m2;
-    q2 &= m2;
-    if (__builtin_expect(__builtin_popcountll(c0) + __builtin_popcountll(c1) + __builtin_popcountll(c2) != 6, 0)) {
-        return false;
-    }
-    uint32_t cs[7];
-    uint64_t ws[3] = {c0, c1, c2};
-    size_t k = 0;
-    for (int wi = 0; wi < 3; ++wi) {
-        uint64_t m = ws[wi];
-        while (m) {
-            cs[k++] = static_cast<uint32_t>(wi * 64) + static_cast<uint32_t>(__builtin_ctzll(m));
-            m &= m - 1;
-        }
-    }
-    cs[6] = L;
-    uint32_t total_q = static_cast<uint32_t>(__builtin_popcountll(q0) + __builtin_popcountll(q1) + __builtin_popcountll(q2));
-    uint32_t stripped = 0;
-    uint32_t s = 0;
-    for (size_t i = 0; i < 7; ++i) {
-        uint32_t e = cs[i];
-        uint32_t len = e - s;
-        uint32_t q = (len >= 2 && line[s] == '"' && line[e - 1] == '"') ? 1U : 0U;
-        f[i] = Field{line + s + q, len - (q << 1)};
-        stripped += (q << 1);
-        s = e + 1;
-    }
-    return stripped == total_q;
-}
-
-// Chunked 4 KB block-classified scanner macro (inlines 100% into caller!).
-#define FAST_SCAN_BLOCKS_LOOP(LOAD64_MACRO) \
-    const char* cur = data; \
-    const char* const end = data + size; \
-    uint64_t nls[64], cms[67], qms[67]; \
-    Field fields[N]; \
-    while (cur + 64 <= end) { \
-        const size_t avail = static_cast<size_t>(end - cur); \
-        const size_t nblks = (avail >> 6) < 64 ? (avail >> 6) : 64; \
-        for (size_t bi = 0; bi < nblks; ++bi) { \
-            if ((bi & 3U) == 0) __builtin_prefetch(cur + (bi << 6) + 1536, 0, 1); \
-            LOAD64_MACRO(cur + (bi << 6), nls[bi], cms[bi], qms[bi]); \
-        } \
-        cms[nblks] = 0; cms[nblks + 1] = 0; cms[nblks + 2] = 0; \
-        qms[nblks] = 0; qms[nblks + 1] = 0; qms[nblks + 2] = 0; \
-        size_t ls = 0; \
-        for (size_t bi = 0; bi < nblks; ++bi) { \
-            uint64_t nm = nls[bi]; \
-            while (nm) { \
-                const size_t nl_rel = (bi << 6) + static_cast<size_t>(__builtin_ctzll(nm)); \
-                nm &= nm - 1; \
-                const uint32_t L = static_cast<uint32_t>(nl_rel - ls); \
-                const size_t sbi = ls >> 6; \
-                const unsigned sh = static_cast<unsigned>(ls & 63U); \
-                if constexpr (N == 7) { \
-                    if (__builtin_expect(L > 0 && L < 128U, 1)) { \
-                        uint64_t c0, c1, q0, q1; \
-                        if (__builtin_expect(sh != 0, 1)) { \
-                            const unsigned rsh = 64U - sh; \
-                            const uint64_t nc = cms[sbi + 1]; \
-                            const uint64_t nq = qms[sbi + 1]; \
-                            c0 = (cms[sbi] >> sh) | (nc << rsh); \
-                            c1 = (nc >> sh) | (cms[sbi + 2] << rsh); \
-                            q0 = (qms[sbi] >> sh) | (nq << rsh); \
-                            q1 = (nq >> sh) | (qms[sbi + 2] << rsh); \
-                        } else { \
-                            c0 = cms[sbi]; c1 = cms[sbi + 1]; \
-                            q0 = qms[sbi]; q1 = qms[sbi + 1]; \
-                        } \
-                        if (__builtin_expect(extract_line128<7>(cur + ls, L, c0, c1, q0, q1, fields), 1)) { \
-                            on_row(fields); \
-                        } \
-                    } else if (__builtin_expect(L >= 128U && L < 192U, 1)) { \
-                        uint64_t c0, c1, c2, q0, q1, q2; \
-                        if (sh != 0) { \
-                            const unsigned rsh = 64U - sh; \
-                            c0 = (cms[sbi] >> sh) | (cms[sbi + 1] << rsh); \
-                            c1 = (cms[sbi + 1] >> sh) | (cms[sbi + 2] << rsh); \
-                            c2 = (cms[sbi + 2] >> sh) | (cms[sbi + 3] << rsh); \
-                            q0 = (qms[sbi] >> sh) | (qms[sbi + 1] << rsh); \
-                            q1 = (qms[sbi + 1] >> sh) | (qms[sbi + 2] << rsh); \
-                            q2 = (qms[sbi + 2] >> sh) | (qms[sbi + 3] << rsh); \
-                        } else { \
-                            c0 = cms[sbi]; c1 = cms[sbi + 1]; c2 = cms[sbi + 2]; \
-                            q0 = qms[sbi]; q1 = qms[sbi + 1]; q2 = qms[sbi + 2]; \
-                        } \
-                        if (__builtin_expect(extract_line192_7(cur + ls, L, c0, c1, c2, q0, q1, q2, fields), 1)) { \
-                            on_row(fields); \
-                        } \
-                    } else if (L >= 192U) { \
-                        if (split_line_exact<7>(cur + ls, cur + nl_rel, fields)) on_row(fields); \
-                    } \
-                } else { \
-                    if (__builtin_expect(L > 0 && L < 64U, 1)) { \
-                        uint64_t c0, q0; \
-                        if (__builtin_expect(sh != 0, 1)) { \
-                            const unsigned rsh = 64U - sh; \
-                            c0 = (cms[sbi] >> sh) | (cms[sbi + 1] << rsh); \
-                            q0 = (qms[sbi] >> sh) | (qms[sbi + 1] << rsh); \
-                        } else { \
-                            c0 = cms[sbi]; q0 = qms[sbi]; \
-                        } \
-                        if (__builtin_expect(extract_line64<N>(cur + ls, L, c0, q0, fields), 1)) { \
-                            on_row(fields); \
-                        } \
-                    } else if (__builtin_expect(L >= 64U && L < 128U, 1)) { \
-                        uint64_t c0, c1, q0, q1; \
-                        if (sh != 0) { \
-                            const unsigned rsh = 64U - sh; \
-                            const uint64_t nc = cms[sbi + 1]; \
-                            const uint64_t nq = qms[sbi + 1]; \
-                            c0 = (cms[sbi] >> sh) | (nc << rsh); \
-                            c1 = (nc >> sh) | (cms[sbi + 2] << rsh); \
-                            q0 = (qms[sbi] >> sh) | (nq << rsh); \
-                            q1 = (nq >> sh) | (qms[sbi + 2] << rsh); \
-                        } else { \
-                            c0 = cms[sbi]; c1 = cms[sbi + 1]; \
-                            q0 = qms[sbi]; q1 = qms[sbi + 1]; \
-                        } \
-                        if (__builtin_expect(extract_line128<N>(cur + ls, L, c0, c1, q0, q1, fields), 1)) { \
-                            on_row(fields); \
-                        } \
-                    } else if (L >= 128U) { \
-                        if (split_line_exact<N>(cur + ls, cur + nl_rel, fields)) on_row(fields); \
-                    } \
-                } \
-                ls = nl_rel + 1; \
-            } \
-        } \
-        if (__builtin_expect(ls == 0, 0)) { \
-            const char* nl = static_cast<const char*>(std::memchr(cur + (nblks << 6), '\n', static_cast<size_t>(end - (cur + (nblks << 6))))); \
-            const char* le = nl ? nl : end; \
-            if (split_line_exact<N>(cur, le, fields)) on_row(fields); \
-            cur = nl ? (nl + 1) : end; \
-        } else { \
-            cur += ls; \
-        } \
-    } \
-    if (cur < end) { \
-        scan_csv_chunk_scalar<N>(cur, static_cast<size_t>(end - cur), on_row); \
-    }
-
-#if defined(__x86_64__) || defined(_M_X64)
-
-#define FAST_LOAD64_AVX512(PTR, NL, CM, QT) do { \
-    __m512i _v = _mm512_loadu_si512(reinterpret_cast<const void*>(PTR)); \
-    NL = _mm512_cmpeq_epi8_mask(_v, v_nl); \
-    CM = _mm512_cmpeq_epi8_mask(_v, v_cm); \
-    QT = _mm512_cmpeq_epi8_mask(_v, v_qt); \
-} while (0)
-
-#define FAST_LOAD64_AVX2(PTR, NL, CM, QT) do { \
-    __m256i _v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(PTR)); \
-    __m256i _v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>((PTR) + 32)); \
-    NL = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_v0, v_nl))) | \
-         (static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_v1, v_nl)))) << 32); \
-    CM = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_v0, v_cm))) | \
-         (static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_v1, v_cm)))) << 32); \
-    QT = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_v0, v_qt))) | \
-         (static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_v1, v_qt)))) << 32); \
-} while (0)
-
-#if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512F__)
-template <size_t N, typename Fn>
-static FAST_ALWAYS_INLINE void scan_csv_chunk_avx512(const char* data, size_t size, Fn&& on_row) {
-    const __m512i v_nl = _mm512_set1_epi8('\n');
-    const __m512i v_cm = _mm512_set1_epi8(',');
-    const __m512i v_qt = _mm512_set1_epi8('"');
-    FAST_SCAN_BLOCKS_LOOP(FAST_LOAD64_AVX512);
-}
-#else
-template <size_t N, typename Fn>
-static FAST_ALWAYS_INLINE void scan_csv_chunk_avx2(const char* data, size_t size, Fn&& on_row) {
-    const __m256i v_nl = _mm256_set1_epi8('\n');
-    const __m256i v_cm = _mm256_set1_epi8(',');
-    const __m256i v_qt = _mm256_set1_epi8('"');
-    FAST_SCAN_BLOCKS_LOOP(FAST_LOAD64_AVX2);
-}
-#endif
-
-#elif defined(__aarch64__)
-
+#if defined(__aarch64__)
 static FAST_ALWAYS_INLINE uint64_t neon_movemask64(uint8x16_t m0, uint8x16_t m1, uint8x16_t m2, uint8x16_t m3) {
     static const uint8_t bit_arr[16] = {
         1, 2, 4, 8, 16, 32, 64, 128,
@@ -941,43 +862,209 @@ static FAST_ALWAYS_INLINE uint64_t neon_movemask64(uint8x16_t m0, uint8x16_t m1,
     sum0 = vpaddq_u8(sum0, sum0);
     return vgetq_lane_u64(vreinterpretq_u64_u8(sum0), 0);
 }
+#endif
 
-#define FAST_LOAD64_NEON(PTR, NL, CM, QT) do { \
-    const uint8_t* _up = reinterpret_cast<const uint8_t*>(PTR); \
-    uint8x16_t _a0 = vld1q_u8(_up); \
-    uint8x16_t _a1 = vld1q_u8(_up + 16); \
-    uint8x16_t _a2 = vld1q_u8(_up + 32); \
-    uint8x16_t _a3 = vld1q_u8(_up + 48); \
-    NL = neon_movemask64(vceqq_u8(_a0, v_nl), vceqq_u8(_a1, v_nl), vceqq_u8(_a2, v_nl), vceqq_u8(_a3, v_nl)); \
-    CM = neon_movemask64(vceqq_u8(_a0, v_cm), vceqq_u8(_a1, v_cm), vceqq_u8(_a2, v_cm), vceqq_u8(_a3, v_cm)); \
-    QT = neon_movemask64(vceqq_u8(_a0, v_qt), vceqq_u8(_a1, v_qt), vceqq_u8(_a2, v_qt), vceqq_u8(_a3, v_qt)); \
-} while (0)
-
-template <size_t N, typename Fn>
-static FAST_ALWAYS_INLINE void scan_csv_chunk_neon(const char* data, size_t size, Fn&& on_row) {
+__attribute__((noinline))
+static size_t k6_stage1(const char* p, size_t nblks, K6Ring& ring) {
+#if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512F__)
+    const __m512i v_nl = _mm512_set1_epi8('\n');
+    const __m512i v_cm = _mm512_set1_epi8(',');
+    const __m512i v_qt = _mm512_set1_epi8('"');
+#elif defined(__AVX2__)
+    const __m256i v_nl = _mm256_set1_epi8('\n');
+    const __m256i v_cm = _mm256_set1_epi8(',');
+    const __m256i v_qt = _mm256_set1_epi8('"');
+#elif defined(__aarch64__)
     const uint8x16_t v_nl = vdupq_n_u8('\n');
     const uint8x16_t v_cm = vdupq_n_u8(',');
     const uint8x16_t v_qt = vdupq_n_u8('"');
-    FAST_SCAN_BLOCKS_LOOP(FAST_LOAD64_NEON);
-}
-
 #endif
+
+    uint32_t* e = ring.e;
+    uint8_t* fl = ring.fl;
+    e[0] = UINT32_MAX;
+    fl[0] = K6_F_NL;
+
+    uint64_t dp = 1ULL << 63;
+    uint64_t qp = 0;
+    uint8_t bin = 1;
+    size_t kb = 1;
+    uint32_t base = 0;
+
+    for (size_t bi = 0; bi < nblks; ++bi, base += 64U) {
+        const char* q = p + base;
+        __builtin_prefetch(q + 1024, 0, 1);
+
+        uint64_t n, c, qq;
+#if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512F__)
+        __m512i v = _mm512_loadu_si512(reinterpret_cast<const void*>(q));
+        n = _mm512_cmpeq_epi8_mask(v, v_nl);
+        c = _mm512_cmpeq_epi8_mask(v, v_cm);
+        qq = _mm512_cmpeq_epi8_mask(v, v_qt);
+#elif defined(__AVX2__)
+        __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
+        __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + 32));
+        n = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_nl))) |
+            (static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_nl)))) << 32);
+        c = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_cm))) |
+            (static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_cm)))) << 32);
+        qq = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v_qt))) |
+             (static_cast<uint64_t>(static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, v_qt)))) << 32);
+#elif defined(__aarch64__)
+        const uint8_t* up = reinterpret_cast<const uint8_t*>(q);
+        uint8x16_t a0 = vld1q_u8(up);
+        uint8x16_t a1 = vld1q_u8(up + 16);
+        uint8x16_t a2 = vld1q_u8(up + 32);
+        uint8x16_t a3 = vld1q_u8(up + 48);
+        n = neon_movemask64(vceqq_u8(a0, v_nl), vceqq_u8(a1, v_nl), vceqq_u8(a2, v_nl), vceqq_u8(a3, v_nl));
+        c = neon_movemask64(vceqq_u8(a0, v_cm), vceqq_u8(a1, v_cm), vceqq_u8(a2, v_cm), vceqq_u8(a3, v_cm));
+        qq = neon_movemask64(vceqq_u8(a0, v_qt), vceqq_u8(a1, v_qt), vceqq_u8(a2, v_qt), vceqq_u8(a3, v_qt));
+#else
+        n = c = qq = 0;
+        for (unsigned k = 0; k < 64U; ++k) {
+            n |= static_cast<uint64_t>(q[k] == '\n') << k;
+            c |= static_cast<uint64_t>(q[k] == ',') << k;
+            qq |= static_cast<uint64_t>(q[k] == '"') << k;
+        }
+#endif
+        uint64_t d = c | n;
+        uint64_t fs = (d << 1) | (dp >> 63);
+        uint64_t qs = (qq << 1) | (qp >> 63);
+        uint64_t fss = (d << 2) | (dp >> 62);
+        uint64_t op = qq & fs;
+
+        uint64_t sum = 0;
+#if defined(__x86_64__) || defined(_M_X64)
+        unsigned long long sum_ull = 0;
+        uint8_t bout = _subborrow_u64(bin, static_cast<unsigned long long>(op),
+                                      static_cast<unsigned long long>(d), &sum_ull);
+        sum = static_cast<uint64_t>(sum_ull);
+#else
+        __uint128_t diff = static_cast<__uint128_t>(op) - static_cast<__uint128_t>(d) - static_cast<__uint128_t>(bin);
+        sum = static_cast<uint64_t>(diff);
+        uint8_t bout = static_cast<uint8_t>((diff >> 64) != 0);
+#endif
+        uint64_t od = sum & d;
+        uint64_t bad = (qs & ~(fss ^ d)) | (d & (od ^ qs));
+        dp = d;
+        qp = qq;
+        bin = bout;
+
+        size_t cnt = static_cast<size_t>(__builtin_popcountll(d));
+        if (__builtin_expect((bad != 0ULL) | (cnt > 8U), 0)) {
+            kb += k6_block_slow(d | bad, qs, n, bad, base, e + kb, fl + kb);
+            continue;
+        }
+
+        uint32_t* ep = e + kb;
+        uint64_t f = d;
+#if defined(__BMI2__)
+        for (int i = 0; i < 8; ++i) {
+            ep[i] = base + static_cast<uint32_t>(__builtin_ctzll(f));
+            f &= f - 1ULL;
+        }
+        uint64_t fl8 = _pdep_u64(_pext_u64(qs, d), K6_L1) +
+                       (_pdep_u64(_pext_u64(n, d), K6_L1) << 1);
+        std::memcpy(fl + kb, &fl8, 8);
+#else
+        uint8_t* flp = fl + kb;
+        for (int i = 0; i < 8; ++i) {
+            uint32_t tz = static_cast<uint32_t>(__builtin_ctzll(f)) & 63U;
+            ep[i] = base + tz;
+            flp[i] = static_cast<uint8_t>(((qs >> tz) & 1ULL) | (((n >> tz) & 1ULL) << 1));
+            f &= f - 1ULL;
+        }
+#endif
+        kb += cnt;
+    }
+
+    uint32_t big = static_cast<uint32_t>(nblks << 6);
+    for (size_t i = 0; i < K6_NSENT; ++i) {
+        e[kb + i] = big;
+        fl[kb + i] = K6_F_BAD;
+    }
+    return kb;
+}
 
 template <size_t N, typename Fn>
 static FAST_ALWAYS_INLINE void scan_csv_chunk(const char* data, size_t size, Fn&& on_row) {
-#if defined(__x86_64__) || defined(_M_X64)
-#if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512F__)
-    scan_csv_chunk_avx512<N>(data, size, static_cast<Fn&&>(on_row));
-#elif defined(__AVX2__)
-    scan_csv_chunk_avx2<N>(data, size, static_cast<Fn&&>(on_row));
-#else
-    scan_csv_chunk_scalar<N>(data, size, static_cast<Fn&&>(on_row));
-#endif
-#elif defined(__aarch64__)
-    scan_csv_chunk_neon<N>(data, size, static_cast<Fn&&>(on_row));
-#else
-    scan_csv_chunk_scalar<N>(data, size, static_cast<Fn&&>(on_row));
-#endif
+    const char* cur = data;
+    const char* const end = data + size;
+    K6Ring ring;
+    Field fields[N];
+
+    // Leave >= 64 readable bytes past scanned segment so AVX2 33B loads on simple lines never cross EOF!
+    while (cur + 128 <= end) {
+        const size_t avail = static_cast<size_t>(end - cur);
+        const size_t nblks = std::min<size_t>((avail - 64) >> 6, K6_NB);
+        const size_t cnt = k6_stage1(cur, nblks, ring);
+        const uint32_t* e = ring.e;
+        const uint8_t* fl = ring.fl;
+
+        size_t k = 1;
+        while (true) {
+            bool simple = false;
+            if constexpr (N == 7) {
+                uint64_t x;
+                std::memcpy(&x, fl + k, 8);
+                simple = ((x & 0x0006060606060606ULL) == 0x0002000000000000ULL);
+            } else if constexpr (N == 4) {
+                uint32_t x;
+                std::memcpy(&x, fl + k, 4);
+                simple = ((x & 0x06060606U) == 0x02000000U);
+            } else if constexpr (N == 2) {
+                uint16_t x;
+                std::memcpy(&x, fl + k, 2);
+                simple = ((x & 0x0606U) == 0x0200U);
+            } else {
+                simple = true;
+                for (size_t j = 0; j + 1 < N; ++j) {
+                    if ((fl[k + j] & (K6_F_NL | K6_F_BAD)) != 0) simple = false;
+                }
+                if ((fl[k + N - 1] & (K6_F_NL | K6_F_BAD)) != K6_F_NL) simple = false;
+            }
+
+            if (__builtin_expect(simple, 1)) {
+                uint32_t prev = e[k - 1] + 1U;
+                for (size_t j = 0; j < N; ++j) {
+                    uint32_t q = fl[k + j] & 1U;
+                    uint32_t ej = e[k + j];
+                    fields[j] = Field{cur + prev + q, (ej - prev) - (q << 1)};
+                    prev = ej + 1U;
+                }
+                on_row(fields);
+                k += N;
+                continue;
+            }
+
+            size_t j = k;
+            while (j < cnt && (fl[j] & K6_F_NL) == 0) ++j;
+            if (__builtin_expect(j < cnt, 1)) {
+                uint32_t ls = e[k - 1] + 1U;
+                if (split_line_exact<N>(cur + ls, cur + e[j], fields)) {
+                    on_row(fields);
+                }
+                k = j + 1;
+                continue;
+            }
+            break;
+        }
+
+        uint32_t ls = e[k - 1] + 1U;
+        if (__builtin_expect(ls == 0U, 0)) {
+            const char* nl = static_cast<const char*>(
+                std::memchr(cur + (nblks << 6), '\n', static_cast<size_t>(end - (cur + (nblks << 6)))));
+            const char* le = nl ? nl : end;
+            if (split_line_exact<N>(cur, le, fields)) on_row(fields);
+            cur = nl ? (nl + 1) : end;
+        } else {
+            cur += ls;
+        }
+    }
+
+    if (cur < end) {
+        scan_csv_chunk_scalar<N>(cur, static_cast<size_t>(end - cur), on_row);
+    }
 }
 
 } // namespace fast
