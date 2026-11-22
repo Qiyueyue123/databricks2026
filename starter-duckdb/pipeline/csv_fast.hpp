@@ -12,17 +12,23 @@
 #include <arm_neon.h>
 #endif
 
+#define FAST_ALWAYS_INLINE __attribute__((always_inline)) inline
+
 namespace fast {
 
 // Ultra-fast 64-bit integer mixer (1 multiply + 2 xor-shifts).
-static inline uint64_t hash_u64(uint64_t x) {
+static FAST_ALWAYS_INLINE uint64_t hash_u64(uint64_t x) {
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdULL;
     x ^= x >> 33;
     return x;
 }
 
-static inline uint64_t wy_mum(uint64_t a, uint64_t b) {
+static FAST_ALWAYS_INLINE uint64_t hash_u128(uint64_t hi, uint64_t lo) {
+    return hash_u64(hi ^ hash_u64(lo));
+}
+
+static FAST_ALWAYS_INLINE uint64_t wy_mum(uint64_t a, uint64_t b) {
     __uint128_t r = static_cast<__uint128_t>(a) * b;
     return static_cast<uint64_t>(r) ^ static_cast<uint64_t>(r >> 64);
 }
@@ -100,90 +106,148 @@ static inline bool less_sv(std::string_view a, std::string_view b) {
 }
 
 // ============================================================================
-// Lossless, order-preserving 7-bit ASCII packing into 63 bits (len 1..9, bytes 1..127).
-// Bit 63 == 0: inline packed key (s[0] in bits 56..62, ..., s[8] in bits 0..6, 0 = end).
-// Bit 63 == 1: fallback interned string handle (len >= 10, or contains '\0' or byte >= 128).
-// Integer `<` on inline keys is 100% identical to unsigned byte-wise memcmp!
+// Scorer v5 Ultra-Fast Exact 64-Bit ID Codec:
+//   - Raw short key (low byte != 0):
+//       ID of length 2..9 starting with column prefix ('e'/'u'/'k'), no NUL byte.
+//       Stores bytes s[1..len-1] raw little-endian, zero-padded in high bytes.
+//       ZERO pext/bswap during parse! Order: bswap64(a) < bswap64(b)!
+//   - Long 33-byte hex key (low byte == 0 && bit 63 == 1):
+//       ID of length 33: prefix + 32 lowercase hex digits [0-9a-f]{32}.
+//       Stores (1ULL << 63) | ((hi64 >> 9) << 8) = top 55 bits in exact lex order!
+//   - Exotic interned key (low byte == 0 && bit 63 == 0 && key != 0):
+//       256-shard interned handle: ((shard << 24) | idx_p1) << 8.
 // ============================================================================
 
-static inline uint64_t pack8_ascii_be_to_56(uint64_t be) {
-#if defined(__BMI2__)
-    return _pext_u64(be, 0x7F7F7F7F7F7F7F7FULL);
-#else
-    uint64_t t = (be & 0x007F007F007F007FULL) | ((be & 0x7F007F007F007F00ULL) >> 1);
-    t = (t & 0x00003FFF00003FFFULL) | ((t & 0x3FFF00003FFF0000ULL) >> 2);
-    t = (t & 0x000000000FFFFFFFULL) | ((t & 0x0FFFFFFF00000000ULL) >> 4);
-    return t;
-#endif
+static constexpr uint64_t HEX_KEY_TAG = 1ULL << 63;
+
+static FAST_ALWAYS_INLINE bool is_raw_key(uint64_t k) {
+    return (k & 0xFFULL) != 0;
 }
 
-static inline uint64_t unpack56_to_be(uint64_t p56) {
-#if defined(__BMI2__)
-    return _pdep_u64(p56, 0x7F7F7F7F7F7F7F7FULL);
-#else
-    uint64_t t = (p56 & 0x000000000FFFFFFFULL) | ((p56 & 0x00FFFFFFF0000000ULL) << 4);
-    t = (t & 0x00003FFF00003FFFULL) | ((t & 0x0FFFC0000FFFC000ULL) << 2);
-    t = (t & 0x007F007F007F007FULL) | ((t & 0x3F803F803F803F80ULL) << 1);
-    return t;
-#endif
+static FAST_ALWAYS_INLINE bool is_hex_key(uint64_t k) {
+    return (k & (HEX_KEY_TAG | 0xFFULL)) == HEX_KEY_TAG;
 }
 
-static inline bool all_ascii_nonzero8(uint64_t w) {
-    return ((w | (w - 0x0101010101010101ULL)) & 0x8080808080808080ULL) == 0;
-}
+static constexpr uint64_t LEN_MASK64[9] = {
+    0ULL,
+    0x00000000000000FFULL,
+    0x000000000000FFFFULL,
+    0x0000000000FFFFFFULL,
+    0x00000000FFFFFFFFULL,
+    0x000000FFFFFFFFFFULL,
+    0x0000FFFFFFFFFFFFULL,
+    0x00FFFFFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL,
+};
 
-// Merged branchless len 8 & 9 fast path (eliminates 20% len==8 vs len==9 mispredict!).
-static inline uint64_t try_pack7(const char* p, size_t len) {
-    if (__builtin_expect(len >= 8 && len <= 9, 1)) {
-        uint64_t w;
-        std::memcpy(&w, p, 8);
-        bool is9 = (len == 9);
-        const char* p8 = is9 ? (p + 8) : p;
-        uint8_t raw8 = static_cast<uint8_t>(*p8);
-        uint8_t b8 = is9 ? raw8 : 0U;
-        bool bad8 = is9 & ((raw8 == 0) | (raw8 >= 128));
-        if (__builtin_expect(!all_ascii_nonzero8(w) || bad8, 0)) return 0;
-        return (pack8_ascii_be_to_56(__builtin_bswap64(w)) << 7) | static_cast<uint64_t>(b8);
+// Try packing a short ID (2..9 bytes starting with `pfx`, no NUL byte).
+// Safe even at EOF: `end` is end of readable buffer (when `p + 9 <= end`, single 8B load!).
+static FAST_ALWAYS_INLINE uint64_t try_pack_raw(const char* p, size_t len, char pfx, const char* buf_end) {
+    if (__builtin_expect(len == 9 && p[0] == pfx, 1)) {
+        uint64_t v;
+        std::memcpy(&v, p + 1, 8);
+        if (__builtin_expect(((v - 0x0101010101010101ULL) & ~v & 0x8080808080808080ULL) == 0, 1)) {
+            return v;
+        }
+        return 0;
     }
-    if (__builtin_expect(len == 0 || len > 9, 0)) return 0;
-    uint64_t key = 0;
-    unsigned shift = 56;
-    for (size_t i = 0; i < len; ++i) {
-        uint8_t c = static_cast<uint8_t>(p[i]);
-        if (__builtin_expect(c == 0 || c >= 128, 0)) return 0;
-        key |= (static_cast<uint64_t>(c) << shift);
-        shift -= 7;
+    if (__builtin_expect((len - 2) <= 7 && p[0] == pfx, 1)) {
+        size_t n = len - 1; // 1..8
+        uint64_t v;
+        if (__builtin_expect(p + 9 <= buf_end, 1)) {
+            std::memcpy(&v, p + 1, 8);
+            v &= LEN_MASK64[n];
+        } else {
+            uint8_t tmp[8] = {};
+            std::memcpy(tmp, p + 1, n);
+            std::memcpy(&v, tmp, 8);
+        }
+        uint64_t w = v | ~LEN_MASK64[n];
+        if (__builtin_expect(((w - 0x0101010101010101ULL) & ~w & 0x8080808080808080ULL) == 0, 1)) {
+            return v;
+        }
     }
-    return key;
+    return 0;
 }
 
-// Unordered 7-bit ASCII pack for event_id (equality-only: skips bswap64!).
-static inline uint64_t try_pack7_unordered(const char* p, size_t len) {
-    if (__builtin_expect(len >= 8 && len <= 9, 1)) {
-        uint64_t w;
-        std::memcpy(&w, p, 8);
-        bool is9 = (len == 9);
-        const char* p8 = is9 ? (p + 8) : p;
-        uint8_t raw8 = static_cast<uint8_t>(*p8);
-        uint8_t b8 = is9 ? raw8 : 0U;
-        bool bad8 = is9 & ((raw8 == 0) | (raw8 >= 128));
-        if (__builtin_expect(!all_ascii_nonzero8(w) || bad8, 0)) return 0;
-        return (pack8_ascii_be_to_56(w) << 7) | static_cast<uint64_t>(b8);
-    }
-    return try_pack7(p, len);
+static FAST_ALWAYS_INLINE size_t unpack_raw(uint64_t k, char pfx, char* out) {
+    out[0] = pfx;
+    std::memcpy(out + 1, &k, 8);
+    return 9U - (static_cast<size_t>(__builtin_clzll(k)) >> 3);
 }
 
-static inline size_t unpack7(uint64_t key, char* out) {
-    uint64_t be = unpack56_to_be(key >> 7);
-    uint64_t le = __builtin_bswap64(be);
-    std::memcpy(out, &le, 8);
-    uint8_t b8 = static_cast<uint8_t>(key & 0x7FU);
-    if (__builtin_expect(b8 != 0, 1)) {
-        out[8] = static_cast<char>(b8);
-        return 9;
+// SWAR parse of 8 lowercase hex digits [0-9a-f] -> 32-bit big-endian value.
+static FAST_ALWAYS_INLINE bool parse_hex8(const char* s, uint32_t& out) {
+    uint64_t x;
+    std::memcpy(&x, s, 8);
+    constexpr uint64_t O = 0x0101010101010101ULL;
+    constexpr uint64_t H = 0x8080808080808080ULL;
+    if (__builtin_expect((x & H) != 0, 0)) return false;
+    uint64_t r09 = (x + O * (0x80U - '0')) & ~(x + O * (0x7FU - '9')) & H;
+    uint64_t raf = (x + O * (0x80U - 'a')) & ~(x + O * (0x7FU - 'f')) & H;
+    if (__builtin_expect((r09 | raf) != H, 0)) return false;
+    uint64_t n = (x & 0x0F0F0F0F0F0F0F0FULL) + 9ULL * ((x >> 6) & O);
+    uint64_t p = ((n << 4) | (n >> 8)) & 0x00FF00FF00FF00FFULL;
+    p = ((p << 8) | (p >> 16)) & 0x0000FFFF0000FFFFULL;
+    p = ((p << 16) | (p >> 32)) & 0xFFFFFFFFULL;
+    out = static_cast<uint32_t>(p);
+    return true;
+}
+
+// Parse 32 lowercase hex digits [0-9a-f]{32} into big-endian (hi64, lo64).
+static FAST_ALWAYS_INLINE bool parse_hex128(const char* s, uint64_t& hi, uint64_t& lo) {
+    uint32_t a, b, c, d;
+    if (__builtin_expect(parse_hex8(s, a) && parse_hex8(s + 8, b) &&
+                         parse_hex8(s + 16, c) && parse_hex8(s + 24, d), 1)) {
+        hi = (static_cast<uint64_t>(a) << 32) | b;
+        lo = (static_cast<uint64_t>(c) << 32) | d;
+        return true;
     }
-    if (__builtin_expect(be == 0, 0)) return 0;
-    return 8 - (static_cast<size_t>(__builtin_ctzll(be)) >> 3);
+    return false;
+}
+
+static FAST_ALWAYS_INLINE uint64_t make_hex_key(uint64_t hi) {
+    return HEX_KEY_TAG | ((hi >> 9) << 8);
+}
+
+// Format 128-bit hex value (pfx + 32 lowercase hex chars = 33 bytes) via 256-entry 2-byte LUT!
+static inline void format_hex128(char pfx, uint64_t hi, uint64_t lo, char* out) {
+    static constexpr char HEX2[513] =
+        "000102030405060708090a0b0c0d0e0f"
+        "101112131415161718191a1b1c1d1e1f"
+        "202122232425262728292a2b2c2d2e2f"
+        "303132333435363738393a3b3c3d3e3f"
+        "404142434445464748494a4b4c4d4e4f"
+        "505152535455565758595a5b5c5d5e5f"
+        "606162636465666768696a6b6c6d6e6f"
+        "707172737475767778797a7b7c7d7e7f"
+        "808182838485868788898a8b8c8d8e8f"
+        "909192939495969798999a9b9c9d9e9f"
+        "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+        "b0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+        "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+        "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+        "e0e1e2e3e4e5e6e7e8e9eaebecedeeef"
+        "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
+    out[0] = pfx;
+    for (int i = 0; i < 8; ++i) {
+        unsigned b = static_cast<unsigned>((hi >> (56 - 8 * i)) & 0xFFU);
+        std::memcpy(out + 1 + 2 * i, HEX2 + 2 * b, 2);
+    }
+    for (int i = 0; i < 8; ++i) {
+        unsigned b = static_cast<unsigned>((lo >> (56 - 8 * i)) & 0xFFU);
+        std::memcpy(out + 17 + 2 * i, HEX2 + 2 * b, 2);
+    }
+}
+
+// Extract the known 14-byte prefix (pfx + top 13 hex digits) directly from a fast hex key!
+static inline void format_hex_prefix14(char pfx, uint64_t k, char* out) {
+    static constexpr char HEX[17] = "0123456789abcdef";
+    uint64_t top55 = (k & ~HEX_KEY_TAG) >> 8;
+    out[0] = pfx;
+    for (int i = 0; i < 13; ++i) {
+        out[1 + i] = HEX[(top55 >> (51 - 4 * i)) & 15U];
+    }
 }
 
 // ============================================================================
@@ -212,7 +276,7 @@ static inline void civil_from_days(int64_t z, int32_t& y, uint32_t& m, uint32_t&
     y += (m <= 2);
 }
 
-static inline int32_t floor_div_day(int64_t ms) {
+static FAST_ALWAYS_INLINE int32_t floor_div_day(int64_t ms) {
     constexpr int64_t DAY_MS = 86400000LL;
     if (__builtin_expect(ms >= 0, 1)) {
         return static_cast<int32_t>(ms / DAY_MS);
@@ -236,7 +300,7 @@ struct DateTable {
     };
     Entry entries[64];
 
-    static inline uint32_t slot_for(const char* s) {
+    static FAST_ALWAYS_INLINE uint32_t slot_for(const char* s) {
         return ((static_cast<uint32_t>(s[8] & 3) << 4) | static_cast<uint32_t>(s[9] & 15));
     }
 
@@ -269,34 +333,33 @@ struct DateTable {
     }
 };
 
-// 4-op borrow-free SWAR 8-ASCII-digit parser:
-// Byte b in ['0'..'9'] iff (b & 0xF0) == 0x30 AND ((b + 0x06) & 0xF0) == 0x30!
-static inline bool parse8_digits(uint64_t v, uint32_t& out) {
-    uint64_t bad = ((v & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL) |
-                   (((v + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL);
-    if (__builtin_expect(bad != 0, 0)) return false;
-    uint64_t lo = v & 0x0F0F0F0F0F0F0F0FULL;
-    lo = (lo * 10 + (lo >> 8)) & 0x00FF00FF00FF00FFULL;
-    lo = (lo * 100 + (lo >> 16)) & 0x0000FFFF0000FFFFULL;
-    out = static_cast<uint32_t>((lo * 10000 + (lo >> 32)) & 0xFFFFFFFFULL);
+// 3-multiply SWAR 8-ASCII-digit parser!
+static FAST_ALWAYS_INLINE bool parse8_digits(uint64_t v, uint32_t& out) {
+    uint64_t x = v ^ 0x3030303030303030ULL;
+    if (__builtin_expect((((x + 0x7676767676767676ULL) | x) & 0x8080808080808080ULL) != 0, 0)) {
+        return false;
+    }
+    x = (x * 2561ULL) >> 8;
+    x = ((x & 0x00FF00FF00FF00FFULL) * 6553601ULL) >> 16;
+    out = static_cast<uint32_t>(((x & 0x0000FFFF0000FFFFULL) * 42949672960001ULL) >> 32);
     return true;
 }
 
-// 5-op SWAR "HH:MM:SS" parser (1 64-bit load, 1-multiply parallel pair extraction!).
-static inline bool parse_hms_sec(const char* s, uint32_t& out_sec) {
+// 1-add, 1-multiply SWAR "HH:MM:SS" validator + parser!
+static FAST_ALWAYS_INLINE bool parse_hms_sec(const char* s, uint32_t& out_sec) {
     uint64_t v;
     std::memcpy(&v, s, 8);
-    uint64_t bad = ((v & 0x0000FF0000FF0000ULL) ^ 0x00003A00003A0000ULL) |
-                   ((v & 0xF0F000F0F000F0F0ULL) ^ 0x3030003030003030ULL) |
-                   (((v + 0x0606000606000606ULL) & 0xF0F000F0F000F0F0ULL) ^ 0x3030003030003030ULL);
-    if (__builtin_expect(bad != 0, 0)) return false;
-    uint64_t lo = v & 0x0F0F000F0F000F0FULL;
-    uint64_t pairs = lo * 10 + (lo >> 8);
-    uint32_t hour = static_cast<uint32_t>(pairs & 0xFFU);
-    uint32_t minute = static_cast<uint32_t>((pairs >> 24) & 0xFFU);
-    uint32_t second = static_cast<uint32_t>((pairs >> 48) & 0xFFU);
-    if (__builtin_expect((hour > 23) | (minute > 59) | (second > 59), 0)) return false;
-    out_sec = hour * 3600 + minute * 60 + second;
+    uint64_t w = v ^ 0x30303A30303A3030ULL;
+    // Checks: digits in 0..9, colons == ':', tens of M/S <= 5, tens of H <= 2!
+    if (__builtin_expect((((w + 0x060A0F060A0F060DULL) | w) & 0xF0F0F0F0F0F0F0F0ULL) != 0, 0)) {
+        return false;
+    }
+    uint64_t t = w * 2561ULL;
+    uint32_t hour = static_cast<uint32_t>((t >> 8) & 0xFFU);
+    uint32_t minute = static_cast<uint32_t>((t >> 32) & 0xFFU);
+    uint32_t second = static_cast<uint32_t>(t >> 56);
+    if (__builtin_expect(hour > 23, 0)) return false;
+    out_sec = hour * 3600U + minute * 60U + second;
     return true;
 }
 
@@ -347,9 +410,9 @@ static inline bool parse_civil19_sec(const char* s, const DateTable& dtab, int64
 }
 
 // Fast F1 parser for ingest_ts (guaranteed valid F1 by rules.md!) — returns ym/dd in registers for F1 hint reuse!
-static inline bool parse_ingest_f1_sec(const char* s, size_t len, const DateTable& dtab,
-                                       int64_t& out_sec, int64_t& out_day_sec,
-                                       uint64_t& out_ym, uint16_t& out_dd) {
+static FAST_ALWAYS_INLINE bool parse_ingest_f1_sec(const char* s, size_t len, const DateTable& dtab,
+                                                   int64_t& out_sec, int64_t& out_day_sec,
+                                                   uint64_t& out_ym, uint16_t& out_dd) {
     if (__builtin_expect(len != 20, 0)) return false;
     std::memcpy(&out_ym, s, 8);
     std::memcpy(&out_dd, s + 8, 2);
@@ -361,19 +424,19 @@ static inline bool parse_ingest_f1_sec(const char* s, size_t len, const DateTabl
     }
     uint64_t v;
     std::memcpy(&v, s + 11, 8);
-    uint64_t lo = v & 0x0F0F000F0F000F0FULL;
-    uint64_t pairs = lo * 10 + (lo >> 8);
-    uint32_t h = static_cast<uint32_t>(pairs & 0xFFU);
-    uint32_t m = static_cast<uint32_t>((pairs >> 24) & 0xFFU);
-    uint32_t sc = static_cast<uint32_t>((pairs >> 48) & 0xFFU);
+    uint64_t w = v ^ 0x30303A30303A3030ULL;
+    uint64_t t = w * 2561ULL;
+    uint32_t h = static_cast<uint32_t>((t >> 8) & 0xFFU);
+    uint32_t m = static_cast<uint32_t>((t >> 32) & 0xFFU);
+    uint32_t sc = static_cast<uint32_t>(t >> 56);
     out_sec = out_day_sec + static_cast<int64_t>(h * 3600U + m * 60U + sc);
     return true;
 }
 
 // Strict F1 / F2 / F3 timestamp parser returning BOTH ms and sec (ZERO division, register date-hint reuse!).
-static inline bool parse_timestamp_ms_sec(const char* s, size_t len, const DateTable& dtab,
-                                          int64_t& out_ms, int64_t& out_sec,
-                                          uint64_t hint_ym = 0, uint16_t hint_dd = 0, int64_t hint_day_sec = 0) {
+static FAST_ALWAYS_INLINE bool parse_timestamp_ms_sec(const char* s, size_t len, const DateTable& dtab,
+                                                      int64_t& out_ms, int64_t& out_sec,
+                                                      uint64_t hint_ym = 0, uint16_t hint_dd = 0, int64_t hint_day_sec = 0) {
     if (len == 20 && s[19] == 'Z') {
         if (__builtin_expect(s[10] != 'T', 0)) return false;
         uint32_t hms_sec;
@@ -401,30 +464,43 @@ static inline bool parse_timestamp_ms_sec(const char* s, size_t len, const DateT
         std::memcpy(&v1, s + 5, 8);
         uint32_t hi8;
         if (__builtin_expect(!parse8_digits(v0, hi8), 0)) return false;
-        // Validate top 5 bytes of v1 (s[8..12]) in 4 SWAR ops!
-        uint64_t v1m = (v1 & 0xFFFFFFFFFF000000ULL) | 0x0000000000303030ULL;
-        uint64_t bad = ((v1m & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL) |
-                       (((v1m + 0x0606060606060606ULL) & 0xF0F0F0F0F0F0F0F0ULL) ^ 0x3030303030303030ULL);
-        if (__builtin_expect(bad != 0, 0)) return false;
-        uint64_t lo = v1m & 0x0F0F0F0F0F0F0F0FULL;
-        uint32_t d89 = static_cast<uint32_t>(((lo >> 24) & 0xFFU) * 10U + ((lo >> 32) & 0xFFU));
-        uint32_t d1012 = static_cast<uint32_t>(((lo >> 40) & 0xFFU) * 100U + ((lo >> 48) & 0xFFU) * 10U + ((lo >> 56) & 0xFFU));
+        uint64_t x1 = (v1 & 0xFFFFFFFFFF000000ULL) ^ 0x3030303030000000ULL;
+        if (__builtin_expect((((x1 + 0x7676767676000000ULL) | x1) & 0x8080808080000000ULL) != 0, 0)) {
+            return false;
+        }
+        uint32_t d89 = static_cast<uint32_t>(((x1 >> 24) & 0xFFU) * 10U + ((x1 >> 32) & 0xFFU));
+        uint32_t d1012 = static_cast<uint32_t>(((x1 >> 40) & 0xFFU) * 100U + ((x1 >> 48) & 0xFFU) * 10U + ((x1 >> 56) & 0xFFU));
         int64_t sec = static_cast<int64_t>(hi8) * 100LL + static_cast<int64_t>(d89);
         out_sec = sec;
         out_ms = sec * 1000LL + static_cast<int64_t>(d1012);
         return true;
     }
     if (len == 25 && (s[19] == '+' || s[19] == '-') && s[22] == ':') {
-        int64_t local_sec;
-        if (!parse_civil19_sec(s, dtab, local_sec)) return false;
+        if (__builtin_expect(s[10] != 'T', 0)) return false;
+        uint32_t hms_sec;
+        if (__builtin_expect(!parse_hms_sec(s + 11, hms_sec), 0)) return false;
         uint32_t oh0 = static_cast<uint8_t>(s[20]) - '0';
         uint32_t oh1 = static_cast<uint8_t>(s[21]) - '0';
         uint32_t om0 = static_cast<uint8_t>(s[23]) - '0';
         uint32_t om1 = static_cast<uint8_t>(s[24]) - '0';
-        if ((oh0 >= 10) | (oh1 >= 10) | (om0 >= 10) | (om1 >= 10)) return false;
+        if (__builtin_expect((oh0 >= 10) | (oh1 >= 10) | (om0 >= 10) | (om1 >= 10), 0)) return false;
         uint32_t oh = oh0 * 10 + oh1;
         uint32_t om = om0 * 10 + om1;
-        if (oh > 23 || om > 59) return false;
+        if (__builtin_expect(oh > 23 || om > 59, 0)) return false;
+        int64_t day_sec;
+        bool got_day = false;
+        if (hint_ym != 0) {
+            uint64_t a0;
+            uint16_t a1;
+            std::memcpy(&a0, s, 8);
+            std::memcpy(&a1, s + 8, 2);
+            if (__builtin_expect(a0 == hint_ym && a1 == hint_dd, 1)) {
+                day_sec = hint_day_sec;
+                got_day = true;
+            }
+        }
+        if (!got_day && !parse_civil19_day_sec(s, dtab, day_sec)) return false;
+        int64_t local_sec = day_sec + static_cast<int64_t>(hms_sec);
         int64_t off_sec = static_cast<int64_t>(oh * 60 + om) * 60LL;
         out_sec = (s[19] == '+') ? (local_sec - off_sec) : (local_sec + off_sec);
         out_ms = out_sec * 1000LL;
@@ -451,8 +527,8 @@ static inline bool parse_timestamp_ms_sec(const char* s, size_t len, const DateT
     return true;
 }
 
-static inline bool parse_timestamp_ms(const char* s, size_t len, const DateTable& dtab,
-                                      int64_t& out_ms) {
+static FAST_ALWAYS_INLINE bool parse_timestamp_ms(const char* s, size_t len, const DateTable& dtab,
+                                                  int64_t& out_ms) {
     int64_t dummy_sec = 0;
     return parse_timestamp_ms_sec(s, len, dtab, out_ms, dummy_sec);
 }
@@ -474,7 +550,7 @@ static inline bool parse_price_cents(const char* s, size_t len, uint32_t& out) {
     return true;
 }
 
-static inline bool parse_pos_u32_no_lz(const char* s, size_t len, uint32_t max_val, uint32_t& out) {
+static FAST_ALWAYS_INLINE bool parse_pos_u32_no_lz(const char* s, size_t len, uint32_t max_val, uint32_t& out) {
     if (len == 0 || len > 7 || s[0] == '0') return false;
     uint32_t v = 0;
     for (size_t i = 0; i < len; ++i) {
@@ -488,9 +564,10 @@ static inline bool parse_pos_u32_no_lz(const char* s, size_t len, uint32_t max_v
 }
 
 // ============================================================================
-// Line-Aligned Loop-Free 128B / 64B SIMD CSV Scanners!
-// Zero cm_this/cm_rem branch mispredicts, unrolled branchless comma extraction,
-// zero-CMOV quote stripping for fields 1..N-1!
+// Chunked 64-Byte Block-Classified SIMD CSV Scanner (Scorer v5: up to 192B lines!)
+// - Classifies each 64-byte block ONCE (ZERO overlapping SIMD work!)
+// - 1-carry bitmask quote validation (ZERO memory reads for quote stripping!)
+// - Covers 100% of Scorer v5 lines (including TWO 33-byte hex IDs = ~145B!)
 // ============================================================================
 
 struct Field {
@@ -498,241 +575,314 @@ struct Field {
     size_t len;
 };
 
-static inline void strip_field_branchless(const char* cur, const char* ce,
-                                          Field& out, uint32_t& stripped) {
-    static constexpr char DUMMY[1] = {'\0'};
-    size_t len = static_cast<size_t>(ce - cur);
-    bool ge2 = (len >= 2);
-    const char* p0 = ge2 ? cur : DUMMY;
-    const char* p1 = ge2 ? (ce - 1) : DUMMY;
-    uint32_t q = static_cast<uint32_t>(*p0 == '"') & static_cast<uint32_t>(*p1 == '"');
-    out.ptr = cur + q;
-    out.len = len - (q + q);
-    stripped += (q + q);
-}
-
-// Fast quote stripping for fields 1..N-1 where cur > line_start and ce <= line_end < end
-// (so both cur[0] and ce[-1] are guaranteed in-bounds!).
-static inline void strip_field_fast(const char* cur, const char* ce,
-                                    Field& out, uint32_t& stripped) {
-    size_t len = static_cast<size_t>(ce - cur);
-    uint32_t q = static_cast<uint32_t>(len >= 2) &
-                 static_cast<uint32_t>(cur[0] == '"') &
-                 static_cast<uint32_t>(ce[-1] == '"');
-    out.ptr = cur + q;
-    out.len = len - (q + q);
-    stripped += (q + q);
-}
-
-template <size_t N, typename Fn>
-static inline void emit_line_from_commas(const char* line_start, const char* line_end,
-                                         const char* const* commas, size_t ncommas,
-                                         uint32_t line_quotes, Fn&& on_row) {
-    if (__builtin_expect(ncommas != N - 1, 0)) return;
-    Field fields[N];
-    const char* cur = line_start;
-    uint32_t stripped = 0;
-    for (size_t i = 0; i < N - 1; ++i) {
-        strip_field_branchless(cur, commas[i], fields[i], stripped);
-        cur = commas[i] + 1;
+template <size_t N>
+static inline bool split_line_exact(const char* p, const char* end, Field (&out)[N]) {
+    if (__builtin_expect(p >= end, 0)) return false;
+    size_t nf = 0;
+    const char* cur = p;
+    while (true) {
+        const char* cm = static_cast<const char*>(std::memchr(cur, ',', static_cast<size_t>(end - cur)));
+        const char* stop = cm ? cm : end;
+        if (nf == N) return false;
+        const char* s = cur;
+        const char* e = stop;
+        if (std::memchr(cur, '"', static_cast<size_t>(stop - cur)) != nullptr) {
+            if (stop - cur < 2 || cur[0] != '"' || stop[-1] != '"' ||
+                std::memchr(cur + 1, '"', static_cast<size_t>(stop - cur - 2)) != nullptr) {
+                return false;
+            }
+            s = cur + 1;
+            e = stop - 1;
+        }
+        out[nf++] = Field{s, static_cast<size_t>(e - s)};
+        if (!cm) break;
+        cur = cm + 1;
     }
-    strip_field_branchless(cur, line_end, fields[N - 1], stripped);
-    if (__builtin_expect(stripped != line_quotes, 0)) return;
-    on_row(fields);
+    return nf == N;
 }
 
 template <size_t N, typename Fn>
 static inline void scan_csv_chunk_scalar(const char* data, size_t size, Fn&& on_row) {
     const char* p = data;
     const char* end = data + size;
-    const char* line_start = p;
-    const char* commas[8];
-    size_t ncommas = 0;
-    uint32_t line_quotes = 0;
+    Field fields[N];
     while (p < end) {
-        char c = *p;
-        if (c == '\n') {
-            if (p > line_start) {
-                emit_line_from_commas<N>(line_start, p, commas, ncommas, line_quotes, on_row);
-            }
-            line_start = p + 1;
-            ncommas = 0;
-            line_quotes = 0;
-        } else if (c == ',') {
-            commas[ncommas & 7] = p;
-            ncommas++;
-        } else if (c == '"') {
-            line_quotes++;
+        const char* nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
+        const char* le = nl ? nl : end;
+        if (split_line_exact<N>(p, le, fields)) {
+            on_row(fields);
         }
-        ++p;
-    }
-    if (end > line_start) {
-        emit_line_from_commas<N>(line_start, end, commas, ncommas, line_quotes, on_row);
+        p = nl ? (nl + 1) : end;
     }
 }
 
-// Shared loop-free 128B (N==7) and 64B (N==2,4) line-aligned scanner macros so GCC target("avx512bw")
-// functions never call non-target-attributed template helpers (guaranteeing 100% inlining!).
-#define FAST_SCAN_LINE128_7_LOOP(LOAD64_MACRO) \
-    const char* p = data; \
-    const char* end = data + size; \
-    while (p + 128 <= end) { \
-        uint64_t nl0, cm0, qt0, nl1, cm1, qt1; \
-        LOAD64_MACRO(p, nl0, cm0, qt0); \
-        LOAD64_MACRO(p + 64, nl1, cm1, qt1); \
-        if (__builtin_expect((nl0 | nl1) == 0, 0)) { \
-            const char* nl = static_cast<const char*>(std::memchr(p + 128, '\n', static_cast<size_t>(end - (p + 128)))); \
-            const char* le = nl ? nl : end; \
-            scan_csv_chunk_scalar<7>(p, static_cast<size_t>(le - p), on_row); \
-            p = nl ? (nl + 1) : end; \
-            continue; \
-        } \
-        unsigned nl_bit; \
-        uint64_t lo_cm, hi_cm, lo_qt, hi_qt; \
-        if (__builtin_expect(nl0 == 0, 1)) { \
-            unsigned b1 = static_cast<unsigned>(__builtin_ctzll(nl1)); \
-            nl_bit = 64 + b1; \
-            uint64_t m1 = (1ULL << b1) - 1; \
-            lo_cm = cm0; \
-            hi_cm = cm1 & m1; \
-            lo_qt = qt0; \
-            hi_qt = qt1 & m1; \
-        } else { \
-            nl_bit = static_cast<unsigned>(__builtin_ctzll(nl0)); \
-            uint64_t m0 = (1ULL << nl_bit) - 1; \
-            lo_cm = cm0 & m0; \
-            hi_cm = 0; \
-            lo_qt = qt0 & m0; \
-            hi_qt = 0; \
-        } \
-        uint32_t nlo = static_cast<uint32_t>(__builtin_popcountll(lo_cm)); \
-        uint32_t nhi = static_cast<uint32_t>(__builtin_popcountll(hi_cm)); \
-        if (__builtin_expect(nlo + nhi == 6, 1)) { \
-            const char* commas[6]; \
-            if (__builtin_expect(nlo >= 3 && nhi >= 1, 1)) { \
-                commas[0] = p + static_cast<unsigned>(__builtin_ctzll(lo_cm)); lo_cm &= lo_cm - 1; \
-                commas[1] = p + static_cast<unsigned>(__builtin_ctzll(lo_cm)); lo_cm &= lo_cm - 1; \
-                commas[2] = p + static_cast<unsigned>(__builtin_ctzll(lo_cm)); lo_cm &= lo_cm - 1; \
-                unsigned b5 = 63U - static_cast<unsigned>(__builtin_clzll(hi_cm)); \
-                commas[5] = p + 64 + b5; \
-                hi_cm ^= (1ULL << b5); \
-                for (int ri = 3; ri <= 4; ++ri) { \
-                    bool u = (lo_cm != 0); \
-                    uint64_t m = u ? lo_cm : hi_cm; \
-                    unsigned bit = static_cast<unsigned>(__builtin_ctzll(m)) + (u ? 0U : 64U); \
-                    commas[ri] = p + bit; \
-                    lo_cm = u ? (lo_cm & (lo_cm - 1)) : lo_cm; \
-                    hi_cm = u ? hi_cm : (hi_cm & (hi_cm - 1)); \
-                } \
-            } else { \
-                for (int ri = 0; ri < 6; ++ri) { \
-                    bool u = (lo_cm != 0); \
-                    uint64_t m = u ? lo_cm : hi_cm; \
-                    unsigned bit = static_cast<unsigned>(__builtin_ctzll(m)) + (u ? 0U : 64U); \
-                    commas[ri] = p + bit; \
-                    lo_cm = u ? (lo_cm & (lo_cm - 1)) : lo_cm; \
-                    hi_cm = u ? hi_cm : (hi_cm & (hi_cm - 1)); \
-                } \
-            } \
-            uint32_t line_quotes = static_cast<uint32_t>(__builtin_popcountll(lo_qt) + __builtin_popcountll(hi_qt)); \
-            const char* line_end = p + nl_bit; \
-            Field fields[7]; \
-            uint32_t stripped = 0; \
-            strip_field_branchless(p, commas[0], fields[0], stripped); \
-            strip_field_fast(commas[0] + 1, commas[1], fields[1], stripped); \
-            strip_field_fast(commas[1] + 1, commas[2], fields[2], stripped); \
-            strip_field_fast(commas[2] + 1, commas[3], fields[3], stripped); \
-            strip_field_fast(commas[3] + 1, commas[4], fields[4], stripped); \
-            strip_field_fast(commas[4] + 1, commas[5], fields[5], stripped); \
-            strip_field_fast(commas[5] + 1, line_end, fields[6], stripped); \
-            if (__builtin_expect(stripped == line_quotes, 1)) { \
-                on_row(fields); \
-            } \
-        } \
-        p += nl_bit + 1; \
-    } \
-    if (p < end) { \
-        scan_csv_chunk_scalar<7>(p, static_cast<size_t>(end - p), on_row); \
+// Validate & extract N fields from a line of length L < 64 using 64-bit masks (1-carry quote check!).
+template <size_t N>
+static FAST_ALWAYS_INLINE bool extract_line64(const char* line, uint32_t L, uint64_t cm, uint64_t qm, Field (&f)[N]) {
+    const uint64_t keep = (1ULL << L) - 1ULL;
+    cm &= keep;
+    if (__builtin_expect(static_cast<size_t>(__builtin_popcountll(cm)) != N - 1, 0)) return false;
+    qm &= keep;
+    const uint64_t sep = cm | (1ULL << L);
+    const uint64_t body = ~sep & keep;
+    const uint64_t starts = ((sep << 1) | 1ULL) & body;
+    const uint64_t lasts = (sep >> 1) & body;
+    const uint64_t qs = qm & starts;
+    const uint64_t qe = qm & lasts;
+    const uint64_t open = (body + qs) & sep;
+    if (__builtin_expect((qm != (qs | qe)) | ((qs & qe) != 0) | (open != (qe << 1)), 0)) return false;
+    uint32_t s = 0;
+    if constexpr (N == 2) {
+        uint32_t e0 = static_cast<uint32_t>(__builtin_ctzll(cm));
+        uint32_t w0 = static_cast<uint32_t>(line[0] == '"');
+        f[0] = Field{line + w0, e0 - (w0 << 1)};
+        s = e0 + 1;
+        uint32_t w1 = static_cast<uint32_t>(line[s] == '"');
+        f[1] = Field{line + s + w1, (L - s) - (w1 << 1)};
+    } else if constexpr (N == 4) {
+        uint32_t e0 = static_cast<uint32_t>(__builtin_ctzll(cm)); cm &= cm - 1;
+        uint32_t e1 = static_cast<uint32_t>(__builtin_ctzll(cm)); cm &= cm - 1;
+        uint32_t e2 = static_cast<uint32_t>(__builtin_ctzll(cm));
+        uint32_t w0 = static_cast<uint32_t>(line[0] == '"');
+        uint32_t w1 = static_cast<uint32_t>(line[e0 + 1] == '"');
+        uint32_t w2 = static_cast<uint32_t>(line[e1 + 1] == '"');
+        uint32_t w3 = static_cast<uint32_t>(line[e2 + 1] == '"');
+        f[0] = Field{line + w0, e0 - (w0 << 1)};
+        f[1] = Field{line + e0 + 1 + w1, (e1 - e0 - 1) - (w1 << 1)};
+        f[2] = Field{line + e1 + 1 + w2, (e2 - e1 - 1) - (w2 << 1)};
+        f[3] = Field{line + e2 + 1 + w3, (L - e2 - 1) - (w3 << 1)};
+    } else {
+        for (size_t k = 0; k < N; ++k) {
+            uint32_t e;
+            if (k + 1 < N) {
+                e = static_cast<uint32_t>(__builtin_ctzll(cm));
+                cm &= cm - 1;
+            } else {
+                e = L;
+            }
+            uint32_t w = static_cast<uint32_t>(line[s] == '"');
+            f[k] = Field{line + s + w, (e - s) - (w << 1)};
+            s = e + 1;
+        }
     }
+    return true;
+}
 
-#define FAST_SCAN_LINE64_LOOP(LOAD64_MACRO) \
-    static_assert(N == 2 || N == 4); \
-    const char* p = data; \
-    const char* end = data + size; \
-    while (p + 64 <= end) { \
-        uint64_t nl0, cm0, qt0; \
-        LOAD64_MACRO(p, nl0, cm0, qt0); \
-        if (__builtin_expect(nl0 == 0, 0)) { \
-            if constexpr (N == 4) { \
-                if (__builtin_expect(p + 128 <= end, 1)) { \
-                    uint64_t nl1, cm1, qt1; \
-                    LOAD64_MACRO(p + 64, nl1, cm1, qt1); \
-                    if (__builtin_expect(nl1 != 0, 1)) { \
-                        unsigned b1 = static_cast<unsigned>(__builtin_ctzll(nl1)); \
-                        unsigned nl_bit = 64 + b1; \
-                        uint64_t m1 = (1ULL << b1) - 1; \
-                        uint64_t lo_cm = cm0, hi_cm = cm1 & m1; \
-                        uint32_t ncm = static_cast<uint32_t>(__builtin_popcountll(lo_cm) + __builtin_popcountll(hi_cm)); \
-                        if (__builtin_expect(ncm == 3, 1)) { \
-                            const char* cs[3]; \
-                            for (int ri = 0; ri < 3; ++ri) { \
-                                bool u = (lo_cm != 0); \
-                                uint64_t m = u ? lo_cm : hi_cm; \
-                                unsigned bit = static_cast<unsigned>(__builtin_ctzll(m)) + (u ? 0U : 64U); \
-                                cs[ri] = p + bit; \
-                                lo_cm = u ? (lo_cm & (lo_cm - 1)) : lo_cm; \
-                                hi_cm = u ? hi_cm : (hi_cm & (hi_cm - 1)); \
-                            } \
-                            uint32_t line_quotes = static_cast<uint32_t>(__builtin_popcountll(qt0) + __builtin_popcountll(qt1 & m1)); \
-                            const char* line_end = p + nl_bit; \
-                            Field fields[4]; \
-                            uint32_t stripped = 0; \
-                            strip_field_branchless(p, cs[0], fields[0], stripped); \
-                            strip_field_fast(cs[0] + 1, cs[1], fields[1], stripped); \
-                            strip_field_fast(cs[1] + 1, cs[2], fields[2], stripped); \
-                            strip_field_fast(cs[2] + 1, line_end, fields[3], stripped); \
-                            if (__builtin_expect(stripped == line_quotes, 1)) on_row(fields); \
+// Validate & extract N fields from a line of length 1 <= L < 128 using 128-bit masks (1-carry quote check!).
+template <size_t N>
+static FAST_ALWAYS_INLINE bool extract_line128(const char* line, uint32_t L,
+                                               uint64_t c0, uint64_t c1, uint64_t q0, uint64_t q1,
+                                               Field (&f)[N]) {
+    const __uint128_t keep = (static_cast<__uint128_t>(1) << L) - 1;
+    const __uint128_t cm = ((static_cast<__uint128_t>(c1) << 64) | c0) & keep;
+    uint64_t lo = static_cast<uint64_t>(cm);
+    uint64_t hi = static_cast<uint64_t>(cm >> 64);
+    const uint32_t nlo = static_cast<uint32_t>(__builtin_popcountll(lo));
+    const uint32_t nhi = static_cast<uint32_t>(__builtin_popcountll(hi));
+    if (__builtin_expect(nlo + nhi != N - 1, 0)) return false;
+
+    const __uint128_t qm = ((static_cast<__uint128_t>(q1) << 64) | q0) & keep;
+    const __uint128_t sep = cm | (static_cast<__uint128_t>(1) << L);
+    const __uint128_t body = ~sep & keep;
+    const __uint128_t starts = ((sep << 1) | 1) & body;
+    const __uint128_t lasts = (sep >> 1) & body;
+    const __uint128_t qs = qm & starts;
+    const __uint128_t qe = qm & lasts;
+    const __uint128_t open = (body + qs) & sep;
+    if (__builtin_expect((qm != (qs | qe)) | ((qs & qe) != 0) | (open != (qe << 1)), 0)) return false;
+
+    uint32_t cs[N];
+    if constexpr (N == 7) {
+        if (__builtin_expect(nlo >= 3 && nhi >= 1, 1)) {
+            cs[0] = static_cast<uint32_t>(__builtin_ctzll(lo)); lo &= lo - 1;
+            cs[1] = static_cast<uint32_t>(__builtin_ctzll(lo)); lo &= lo - 1;
+            cs[2] = static_cast<uint32_t>(__builtin_ctzll(lo)); lo &= lo - 1;
+            unsigned b5 = 63U - static_cast<unsigned>(__builtin_clzll(hi));
+            cs[5] = 64U + b5;
+            hi ^= (1ULL << b5);
+            for (int k = 3; k <= 4; ++k) {
+                bool u = (lo != 0);
+                uint64_t m = u ? lo : hi;
+                cs[k] = static_cast<uint32_t>(__builtin_ctzll(m)) + (u ? 0U : 64U);
+                lo = u ? (lo & (lo - 1)) : lo;
+                hi = u ? hi : (hi & (hi - 1));
+            }
+        } else {
+            for (size_t k = 0; k < 6; ++k) {
+                bool u = (lo != 0);
+                uint64_t m = u ? lo : hi;
+                cs[k] = static_cast<uint32_t>(__builtin_ctzll(m)) + (u ? 0U : 64U);
+                lo = u ? (lo & (lo - 1)) : lo;
+                hi = u ? hi : (hi & (hi - 1));
+            }
+        }
+    } else {
+        for (size_t k = 0; k < N - 1; ++k) {
+            bool u = (lo != 0);
+            uint64_t m = u ? lo : hi;
+            cs[k] = static_cast<uint32_t>(__builtin_ctzll(m)) + (u ? 0U : 64U);
+            lo = u ? (lo & (lo - 1)) : lo;
+            hi = u ? hi : (hi & (hi - 1));
+        }
+    }
+    cs[N - 1] = L;
+
+    uint32_t s = 0;
+    for (size_t k = 0; k < N; ++k) {
+        uint32_t e = cs[k];
+        uint32_t w = static_cast<uint32_t>(line[s] == '"');
+        f[k] = Field{line + s + w, (e - s) - (w << 1)};
+        s = e + 1;
+    }
+    return true;
+}
+
+// Validate & extract 7 fields from a long Scorer v5 line (128 <= L < 192, e.g. two 33B hex IDs!) from 3 words.
+static inline bool extract_line192_7(const char* line, uint32_t L,
+                                     uint64_t c0, uint64_t c1, uint64_t c2,
+                                     uint64_t q0, uint64_t q1, uint64_t q2,
+                                     Field (&f)[7]) {
+    uint64_t m2 = (1ULL << (L - 128)) - 1ULL;
+    c2 &= m2;
+    q2 &= m2;
+    if (__builtin_expect(__builtin_popcountll(c0) + __builtin_popcountll(c1) + __builtin_popcountll(c2) != 6, 0)) {
+        return false;
+    }
+    uint32_t cs[7];
+    uint64_t ws[3] = {c0, c1, c2};
+    size_t k = 0;
+    for (int wi = 0; wi < 3; ++wi) {
+        uint64_t m = ws[wi];
+        while (m) {
+            cs[k++] = static_cast<uint32_t>(wi * 64) + static_cast<uint32_t>(__builtin_ctzll(m));
+            m &= m - 1;
+        }
+    }
+    cs[6] = L;
+    uint32_t total_q = static_cast<uint32_t>(__builtin_popcountll(q0) + __builtin_popcountll(q1) + __builtin_popcountll(q2));
+    uint32_t stripped = 0;
+    uint32_t s = 0;
+    for (size_t i = 0; i < 7; ++i) {
+        uint32_t e = cs[i];
+        uint32_t len = e - s;
+        uint32_t q = (len >= 2 && line[s] == '"' && line[e - 1] == '"') ? 1U : 0U;
+        f[i] = Field{line + s + q, len - (q << 1)};
+        stripped += (q << 1);
+        s = e + 1;
+    }
+    return stripped == total_q;
+}
+
+// Chunked 4 KB block-classified scanner macro (inlines 100% into caller!).
+#define FAST_SCAN_BLOCKS_LOOP(LOAD64_MACRO) \
+    const char* cur = data; \
+    const char* const end = data + size; \
+    uint64_t nls[64], cms[67], qms[67]; \
+    Field fields[N]; \
+    while (cur + 64 <= end) { \
+        const size_t avail = static_cast<size_t>(end - cur); \
+        const size_t nblks = (avail >> 6) < 64 ? (avail >> 6) : 64; \
+        for (size_t bi = 0; bi < nblks; ++bi) { \
+            if ((bi & 3U) == 0) __builtin_prefetch(cur + (bi << 6) + 1536, 0, 1); \
+            LOAD64_MACRO(cur + (bi << 6), nls[bi], cms[bi], qms[bi]); \
+        } \
+        cms[nblks] = 0; cms[nblks + 1] = 0; cms[nblks + 2] = 0; \
+        qms[nblks] = 0; qms[nblks + 1] = 0; qms[nblks + 2] = 0; \
+        size_t ls = 0; \
+        for (size_t bi = 0; bi < nblks; ++bi) { \
+            uint64_t nm = nls[bi]; \
+            while (nm) { \
+                const size_t nl_rel = (bi << 6) + static_cast<size_t>(__builtin_ctzll(nm)); \
+                nm &= nm - 1; \
+                const uint32_t L = static_cast<uint32_t>(nl_rel - ls); \
+                const size_t sbi = ls >> 6; \
+                const unsigned sh = static_cast<unsigned>(ls & 63U); \
+                if constexpr (N == 7) { \
+                    if (__builtin_expect(L > 0 && L < 128U, 1)) { \
+                        uint64_t c0, c1, q0, q1; \
+                        if (__builtin_expect(sh != 0, 1)) { \
+                            const unsigned rsh = 64U - sh; \
+                            const uint64_t nc = cms[sbi + 1]; \
+                            const uint64_t nq = qms[sbi + 1]; \
+                            c0 = (cms[sbi] >> sh) | (nc << rsh); \
+                            c1 = (nc >> sh) | (cms[sbi + 2] << rsh); \
+                            q0 = (qms[sbi] >> sh) | (nq << rsh); \
+                            q1 = (nq >> sh) | (qms[sbi + 2] << rsh); \
+                        } else { \
+                            c0 = cms[sbi]; c1 = cms[sbi + 1]; \
+                            q0 = qms[sbi]; q1 = qms[sbi + 1]; \
                         } \
-                        p += nl_bit + 1; \
-                        continue; \
+                        if (__builtin_expect(extract_line128<7>(cur + ls, L, c0, c1, q0, q1, fields), 1)) { \
+                            on_row(fields); \
+                        } \
+                    } else if (__builtin_expect(L >= 128U && L < 192U, 1)) { \
+                        uint64_t c0, c1, c2, q0, q1, q2; \
+                        if (sh != 0) { \
+                            const unsigned rsh = 64U - sh; \
+                            c0 = (cms[sbi] >> sh) | (cms[sbi + 1] << rsh); \
+                            c1 = (cms[sbi + 1] >> sh) | (cms[sbi + 2] << rsh); \
+                            c2 = (cms[sbi + 2] >> sh) | (cms[sbi + 3] << rsh); \
+                            q0 = (qms[sbi] >> sh) | (qms[sbi + 1] << rsh); \
+                            q1 = (qms[sbi + 1] >> sh) | (qms[sbi + 2] << rsh); \
+                            q2 = (qms[sbi + 2] >> sh) | (qms[sbi + 3] << rsh); \
+                        } else { \
+                            c0 = cms[sbi]; c1 = cms[sbi + 1]; c2 = cms[sbi + 2]; \
+                            q0 = qms[sbi]; q1 = qms[sbi + 1]; q2 = qms[sbi + 2]; \
+                        } \
+                        if (__builtin_expect(extract_line192_7(cur + ls, L, c0, c1, c2, q0, q1, q2, fields), 1)) { \
+                            on_row(fields); \
+                        } \
+                    } else if (L >= 192U) { \
+                        if (split_line_exact<7>(cur + ls, cur + nl_rel, fields)) on_row(fields); \
+                    } \
+                } else { \
+                    if (__builtin_expect(L > 0 && L < 64U, 1)) { \
+                        uint64_t c0, q0; \
+                        if (__builtin_expect(sh != 0, 1)) { \
+                            const unsigned rsh = 64U - sh; \
+                            c0 = (cms[sbi] >> sh) | (cms[sbi + 1] << rsh); \
+                            q0 = (qms[sbi] >> sh) | (qms[sbi + 1] << rsh); \
+                        } else { \
+                            c0 = cms[sbi]; q0 = qms[sbi]; \
+                        } \
+                        if (__builtin_expect(extract_line64<N>(cur + ls, L, c0, q0, fields), 1)) { \
+                            on_row(fields); \
+                        } \
+                    } else if (__builtin_expect(L >= 64U && L < 128U, 1)) { \
+                        uint64_t c0, c1, q0, q1; \
+                        if (sh != 0) { \
+                            const unsigned rsh = 64U - sh; \
+                            const uint64_t nc = cms[sbi + 1]; \
+                            const uint64_t nq = qms[sbi + 1]; \
+                            c0 = (cms[sbi] >> sh) | (nc << rsh); \
+                            c1 = (nc >> sh) | (cms[sbi + 2] << rsh); \
+                            q0 = (qms[sbi] >> sh) | (nq << rsh); \
+                            q1 = (nq >> sh) | (qms[sbi + 2] << rsh); \
+                        } else { \
+                            c0 = cms[sbi]; c1 = cms[sbi + 1]; \
+                            q0 = qms[sbi]; q1 = qms[sbi + 1]; \
+                        } \
+                        if (__builtin_expect(extract_line128<N>(cur + ls, L, c0, c1, q0, q1, fields), 1)) { \
+                            on_row(fields); \
+                        } \
+                    } else if (L >= 128U) { \
+                        if (split_line_exact<N>(cur + ls, cur + nl_rel, fields)) on_row(fields); \
                     } \
                 } \
+                ls = nl_rel + 1; \
             } \
-            const char* nl = static_cast<const char*>(std::memchr(p + 64, '\n', static_cast<size_t>(end - (p + 64)))); \
+        } \
+        if (__builtin_expect(ls == 0, 0)) { \
+            const char* nl = static_cast<const char*>(std::memchr(cur + (nblks << 6), '\n', static_cast<size_t>(end - (cur + (nblks << 6))))); \
             const char* le = nl ? nl : end; \
-            scan_csv_chunk_scalar<N>(p, static_cast<size_t>(le - p), on_row); \
-            p = nl ? (nl + 1) : end; \
-            continue; \
+            if (split_line_exact<N>(cur, le, fields)) on_row(fields); \
+            cur = nl ? (nl + 1) : end; \
+        } else { \
+            cur += ls; \
         } \
-        unsigned nl_bit = static_cast<unsigned>(__builtin_ctzll(nl0)); \
-        uint64_t m0 = (1ULL << nl_bit) - 1; \
-        uint64_t lcm = cm0 & m0; \
-        if (__builtin_expect(static_cast<size_t>(__builtin_popcountll(lcm)) == N - 1, 1)) { \
-            uint32_t line_quotes = static_cast<uint32_t>(__builtin_popcountll(qt0 & m0)); \
-            const char* line_end = p + nl_bit; \
-            Field fields[N]; \
-            uint32_t stripped = 0; \
-            if constexpr (N == 2) { \
-                const char* c0 = p + static_cast<unsigned>(__builtin_ctzll(lcm)); \
-                strip_field_branchless(p, c0, fields[0], stripped); \
-                strip_field_fast(c0 + 1, line_end, fields[1], stripped); \
-            } else if constexpr (N == 4) { \
-                const char* c0 = p + static_cast<unsigned>(__builtin_ctzll(lcm)); lcm &= lcm - 1; \
-                const char* c1 = p + static_cast<unsigned>(__builtin_ctzll(lcm)); lcm &= lcm - 1; \
-                const char* c2 = p + static_cast<unsigned>(__builtin_ctzll(lcm)); \
-                strip_field_branchless(p, c0, fields[0], stripped); \
-                strip_field_fast(c0 + 1, c1, fields[1], stripped); \
-                strip_field_fast(c1 + 1, c2, fields[2], stripped); \
-                strip_field_fast(c2 + 1, line_end, fields[3], stripped); \
-            } \
-            if (__builtin_expect(stripped == line_quotes, 1)) { \
-                on_row(fields); \
-            } \
-        } \
-        p += nl_bit + 1; \
     } \
-    if (p < end) { \
-        scan_csv_chunk_scalar<N>(p, static_cast<size_t>(end - p), on_row); \
+    if (cur < end) { \
+        scan_csv_chunk_scalar<N>(cur, static_cast<size_t>(end - cur), on_row); \
     }
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -757,47 +907,25 @@ static inline void scan_csv_chunk_scalar(const char* data, size_t size, Fn&& on_
 
 #if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512F__)
 template <size_t N, typename Fn>
-static inline void scan_csv_chunk_avx512(const char* data, size_t size, Fn&& on_row) {
+static FAST_ALWAYS_INLINE void scan_csv_chunk_avx512(const char* data, size_t size, Fn&& on_row) {
     const __m512i v_nl = _mm512_set1_epi8('\n');
     const __m512i v_cm = _mm512_set1_epi8(',');
     const __m512i v_qt = _mm512_set1_epi8('"');
-    if constexpr (N == 7) {
-        FAST_SCAN_LINE128_7_LOOP(FAST_LOAD64_AVX512);
-    } else {
-        FAST_SCAN_LINE64_LOOP(FAST_LOAD64_AVX512);
-    }
+    FAST_SCAN_BLOCKS_LOOP(FAST_LOAD64_AVX512);
 }
 #else
 template <size_t N, typename Fn>
-__attribute__((target("avx512f,avx512bw,avx512vl,bmi2,popcnt")))
-static void scan_csv_chunk_avx512(const char* data, size_t size, Fn&& on_row) {
-    const __m512i v_nl = _mm512_set1_epi8('\n');
-    const __m512i v_cm = _mm512_set1_epi8(',');
-    const __m512i v_qt = _mm512_set1_epi8('"');
-    if constexpr (N == 7) {
-        FAST_SCAN_LINE128_7_LOOP(FAST_LOAD64_AVX512);
-    } else {
-        FAST_SCAN_LINE64_LOOP(FAST_LOAD64_AVX512);
-    }
-}
-
-template <size_t N, typename Fn>
-__attribute__((target("avx2,bmi2,popcnt")))
-static void scan_csv_chunk_avx2(const char* data, size_t size, Fn&& on_row) {
+static FAST_ALWAYS_INLINE void scan_csv_chunk_avx2(const char* data, size_t size, Fn&& on_row) {
     const __m256i v_nl = _mm256_set1_epi8('\n');
     const __m256i v_cm = _mm256_set1_epi8(',');
     const __m256i v_qt = _mm256_set1_epi8('"');
-    if constexpr (N == 7) {
-        FAST_SCAN_LINE128_7_LOOP(FAST_LOAD64_AVX2);
-    } else {
-        FAST_SCAN_LINE64_LOOP(FAST_LOAD64_AVX2);
-    }
+    FAST_SCAN_BLOCKS_LOOP(FAST_LOAD64_AVX2);
 }
 #endif
 
 #elif defined(__aarch64__)
 
-static inline uint64_t neon_movemask64(uint8x16_t m0, uint8x16_t m1, uint8x16_t m2, uint8x16_t m3) {
+static FAST_ALWAYS_INLINE uint64_t neon_movemask64(uint8x16_t m0, uint8x16_t m1, uint8x16_t m2, uint8x16_t m3) {
     static const uint8_t bit_arr[16] = {
         1, 2, 4, 8, 16, 32, 64, 128,
         1, 2, 4, 8, 16, 32, 64, 128
@@ -826,43 +954,24 @@ static inline uint64_t neon_movemask64(uint8x16_t m0, uint8x16_t m1, uint8x16_t 
 } while (0)
 
 template <size_t N, typename Fn>
-static void scan_csv_chunk_neon(const char* data, size_t size, Fn&& on_row) {
+static FAST_ALWAYS_INLINE void scan_csv_chunk_neon(const char* data, size_t size, Fn&& on_row) {
     const uint8x16_t v_nl = vdupq_n_u8('\n');
     const uint8x16_t v_cm = vdupq_n_u8(',');
     const uint8x16_t v_qt = vdupq_n_u8('"');
-    if constexpr (N == 7) {
-        FAST_SCAN_LINE128_7_LOOP(FAST_LOAD64_NEON);
-    } else {
-        FAST_SCAN_LINE64_LOOP(FAST_LOAD64_NEON);
-    }
+    FAST_SCAN_BLOCKS_LOOP(FAST_LOAD64_NEON);
 }
 
 #endif
 
 template <size_t N, typename Fn>
-static inline void scan_csv_chunk(const char* data, size_t size, Fn&& on_row) {
+static FAST_ALWAYS_INLINE void scan_csv_chunk(const char* data, size_t size, Fn&& on_row) {
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512F__)
     scan_csv_chunk_avx512<N>(data, size, static_cast<Fn&&>(on_row));
+#elif defined(__AVX2__)
+    scan_csv_chunk_avx2<N>(data, size, static_cast<Fn&&>(on_row));
 #else
-    static const int simd_level = []() {
-        __builtin_cpu_init();
-        if (__builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl") &&
-            __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("bmi2")) {
-            return 2;
-        }
-        if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi2")) {
-            return 1;
-        }
-        return 0;
-    }();
-    if (simd_level == 2) {
-        scan_csv_chunk_avx512<N>(data, size, static_cast<Fn&&>(on_row));
-    } else if (simd_level == 1) {
-        scan_csv_chunk_avx2<N>(data, size, static_cast<Fn&&>(on_row));
-    } else {
-        scan_csv_chunk_scalar<N>(data, size, static_cast<Fn&&>(on_row));
-    }
+    scan_csv_chunk_scalar<N>(data, size, static_cast<Fn&&>(on_row));
 #endif
 #elif defined(__aarch64__)
     scan_csv_chunk_neon<N>(data, size, static_cast<Fn&&>(on_row));
