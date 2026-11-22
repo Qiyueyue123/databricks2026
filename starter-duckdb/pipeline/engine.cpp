@@ -352,6 +352,22 @@ public:
         size_t idx = static_cast<size_t>(((key >> 8) & 0xFFFFFFULL) - 1ULL);
         return shards_[sh].strs[idx];
     }
+
+    inline std::string_view get_locked(uint64_t key) const {
+        size_t sh = static_cast<size_t>((key >> 32) & 255ULL);
+        size_t idx = static_cast<size_t>(((key >> 8) & 0xFFFFFFULL) - 1ULL);
+        auto& s = const_cast<Shard&>(shards_[sh]);
+        while (s.lock.test_and_set(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            asm volatile("yield" ::: "memory");
+#endif
+        }
+        std::string_view sv = s.strs[idx];
+        s.lock.clear(std::memory_order_release);
+        return sv;
+    }
 };
 
 // Per-thread lazy L2-cached collector for 33-byte hex user_ids (single 16B cache line per probe!).
@@ -554,18 +570,22 @@ struct KeyEnv {
         bool a_hex = fast::is_hex_key(a);
         bool b_hex = fast::is_hex_key(b);
         if (a_hex && b_hex) {
-            // Fast mode: distinct top 55 bits decide order; equal keys are identical (checked by verify_and_build!).
+            // Fast mode: distinct top 55 bits decide order; equal keys are identical (checked by verify_and_build / tie guards!).
             return a < b;
         }
-        if ((a_hex || b_hex) && !long_users.verified) {
-            // One side is an unverified fast hex key, the other is raw or exotic:
-            // compare other against the known 14-byte prefix (pfx + 13 hex digits)!
+        auto get_exotic = [&](uint64_t k) -> std::string_view {
+            return long_users.verified ? exotic.get_unlocked(k) : exotic.get_locked(k);
+        };
+        if (a_hex || b_hex) {
+            // Exactly one side is a 33-byte fast hex key (user_id OR click_id), the other is raw or exotic.
+            // ALWAYS compare against the exact 14-byte prefix (pfx + 13 hex digits) first — NEVER look up
+            // a click_id ('k') in long_users (which only stores user_ids 'u')!
             uint64_t hkey = a_hex ? a : b;
             uint64_t okey = a_hex ? b : a;
-            char obuf[40], hbuf[16];
+            char obuf[40], hbuf[40];
             std::string_view osv = fast::is_raw_key(okey)
                                        ? std::string_view(obuf, fast::unpack_raw(okey, pfx, obuf))
-                                       : exotic.get_unlocked(okey);
+                                       : get_exotic(okey);
             fast::format_hex_prefix14(pfx, hkey, hbuf);
             size_t m = std::min<size_t>(osv.size(), 14);
             int c = m ? std::memcmp(osv.data(), hbuf, m) : 0;
@@ -575,6 +595,10 @@ struct KeyEnv {
             } else if (osv.size() <= 14) {
                 // Proper prefix of the 33-byte hex string!
                 cmp_o_vs_h = -1;
+            } else if (pfx == 'u' && long_users.verified) {
+                U128 v = long_users.lookup(hkey);
+                fast::format_hex128(pfx, v.hi, v.lo, hbuf);
+                cmp_o_vs_h = fast::cmp_bytes(osv.data(), osv.size(), hbuf, 33);
             } else {
                 long_users.need_exact.store(true, std::memory_order_relaxed);
                 cmp_o_vs_h = 0;
@@ -582,8 +606,8 @@ struct KeyEnv {
             return a_hex ? (cmp_o_vs_h > 0) : (cmp_o_vs_h < 0);
         }
         char ba[40], bb[40];
-        auto sa = key_to_sv(a, pfx, ba);
-        auto sb = key_to_sv(b, pfx, bb);
+        std::string_view sa = fast::is_raw_key(a) ? std::string_view(ba, fast::unpack_raw(a, pfx, ba)) : get_exotic(a);
+        std::string_view sb = fast::is_raw_key(b) ? std::string_view(bb, fast::unpack_raw(b, pfx, bb)) : get_exotic(b);
         return fast::cmp_bytes(sa.data(), sa.size(), sb.data(), sb.size()) < 0;
     }
 
@@ -1708,6 +1732,8 @@ void parse_links_and_build_identity_single(const InputFile* link_files,
         uint64_t ka = arr[i].a;
         uint64_t kb = arr[i].b;
         if (__builtin_expect(ka == kb, 0)) continue;
+        // Pre-check growth before interning BOTH endpoints so intern(kb) can never reallocate table while u is live!
+        if (__builtin_expect((num_nodes + 2) * 10 >= cap * 7, 0)) grow_table();
         uint32_t u = find_r(intern(ka));
         uint32_t v = find_r(intern(kb));
         if (u == v) continue;
@@ -2147,6 +2173,15 @@ static const ClickItem* sort_clicks(ClickItem* a, size_t n, const KeyEnv& kenv,
                         }
                         return kenv.key_less(y.cid, x.cid, 'k');
                     });
+                    if (__builtin_expect(fast::is_hex_key(src[i - 1].cid), 0)) {
+                        uint64_t wcid = src[i - 1].cid;
+                        uint32_t wcamp = static_cast<uint32_t>(src[i - 1].ts_camp & 0xFFFFFU);
+                        for (size_t z = st; z + 1 < i; ++z) {
+                            if (src[z].cid == wcid && static_cast<uint32_t>(src[z].ts_camp & 0xFFFFFU) != wcamp) {
+                                kenv.long_users.need_exact.store(true, std::memory_order_relaxed);
+                            }
+                        }
+                    }
                 }
             }
             return src;
