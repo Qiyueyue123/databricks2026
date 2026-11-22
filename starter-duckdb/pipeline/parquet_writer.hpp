@@ -3,14 +3,16 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <string>
 #include <string_view>
+#include <unistd.h>
 #include <vector>
 
 namespace pq {
 
 // Minimal, zero-dependency, Apache Parquet v1 writer (UNCOMPRESSED, PLAIN + RLE def levels).
-// Encodes metadata with Thrift Compact Protocol per parquet.thrift.
+// Uses direct POSIX write() with zero-copy bypass for large column buffers!
 
 enum PhysicalType : int32_t {
     PT_BOOLEAN = 0,
@@ -150,19 +152,46 @@ struct RowGroupMeta {
 };
 
 class ParquetFileWriter {
-    FILE* fp_ = nullptr;
+    int fd_ = -1;
     int64_t pos_ = 0;
     std::vector<ColumnSpec> schema_;
     std::vector<RowGroupMeta> row_groups_;
     int64_t total_rows_ = 0;
-    std::vector<uint8_t> io_buf_;
+    uint8_t io_buf_[256 * 1024];
+    size_t io_pos_ = 0;
     std::vector<uint8_t> def_buf_;
     ThriftWriter tw_;
 
+    bool write_all_fd(const uint8_t* p, size_t len) {
+        while (len > 0) {
+            ssize_t w = ::write(fd_, p, len);
+            if (w <= 0) return false;
+            p += static_cast<size_t>(w);
+            len -= static_cast<size_t>(w);
+        }
+        return true;
+    }
+
+    bool flush_io() {
+        if (io_pos_ == 0) return true;
+        bool ok = write_all_fd(io_buf_, io_pos_);
+        io_pos_ = 0;
+        return ok;
+    }
+
     bool write_raw(const void* data, size_t len) {
         if (len == 0) return true;
-        if (fwrite(data, 1, len, fp_) != len) return false;
         pos_ += static_cast<int64_t>(len);
+        const uint8_t* p = static_cast<const uint8_t*>(data);
+        if (len >= sizeof(io_buf_) / 2) {
+            if (!flush_io()) return false;
+            return write_all_fd(p, len);
+        }
+        if (io_pos_ + len > sizeof(io_buf_)) {
+            if (!flush_io()) return false;
+        }
+        std::memcpy(io_buf_ + io_pos_, p, len);
+        io_pos_ += len;
         return true;
     }
 
@@ -191,27 +220,25 @@ class ParquetFileWriter {
     }
 
 public:
-    ParquetFileWriter() : io_buf_(1 << 20) {}
+    ParquetFileWriter() = default;
     ~ParquetFileWriter() {
-        if (fp_) fclose(fp_);
+        if (fd_ >= 0) ::close(fd_);
     }
 
     bool open(const std::string& path, std::vector<ColumnSpec> schema) {
         schema_ = std::move(schema);
-        fp_ = fopen(path.c_str(), "wb");
-        if (!fp_) return false;
-        setvbuf(fp_, reinterpret_cast<char*>(io_buf_.data()), _IOFBF, io_buf_.size());
+        fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd_ < 0) return false;
         pos_ = 0;
+        io_pos_ = 0;
         total_rows_ = 0;
         row_groups_.clear();
         return write_raw("PAR1", 4);
     }
 
     struct ColumnData {
-        // For INT32 / INT64 / required BYTE_ARRAY: raw PLAIN bytes.
         const void* plain_data = nullptr;
         size_t plain_bytes = 0;
-        // For optional BYTE_ARRAY (def_bits != nullptr): 1 bit per row (LSB first).
         const uint8_t* def_bits = nullptr;
     };
 
@@ -233,9 +260,8 @@ public:
                 write_page_header(page_size, static_cast<int32_t>(num_rows));
                 write_raw(col.plain_data, col.plain_bytes);
             } else {
-                // Encode 1-bit definition levels in bit-packed runs of <= 1024 groups (8192 values).
                 def_buf_.clear();
-                def_buf_.resize(4, 0); // placeholder for 4-byte LE byte length
+                def_buf_.resize(4, 0);
                 size_t total_groups = static_cast<size_t>((num_rows + 7) / 8);
                 size_t g = 0;
                 while (g < total_groups) {
@@ -266,19 +292,16 @@ public:
     }
 
     bool close() {
-        if (!fp_) return false;
+        if (fd_ < 0) return false;
         tw_.clear();
         tw_.struct_begin();
-        tw_.field_i32(1, 1); // version = 1
+        tw_.field_i32(1, 1);
 
-        // field 2: schema
         tw_.field_list_begin(2, 12, schema_.size() + 1);
-        // Root element
         tw_.struct_begin();
         tw_.field_string(4, "schema");
         tw_.field_i32(5, static_cast<int32_t>(schema_.size()));
         tw_.struct_end();
-        // Leaf elements
         for (const auto& spec : schema_) {
             tw_.struct_begin();
             tw_.field_i32(1, spec.type);
@@ -286,12 +309,12 @@ public:
             tw_.field_string(4, spec.name);
             if (spec.converted != CT_NONE) {
                 tw_.field_i32(6, spec.converted);
-                tw_.field_struct_begin(10); // logicalType union
+                tw_.field_struct_begin(10);
                 if (spec.converted == CT_UTF8) {
-                    tw_.field_struct_begin(1); // StringType
+                    tw_.field_struct_begin(1);
                     tw_.struct_end();
                 } else if (spec.converted == CT_DATE) {
-                    tw_.field_struct_begin(6); // DateType
+                    tw_.field_struct_begin(6);
                     tw_.struct_end();
                 }
                 tw_.struct_end();
@@ -299,18 +322,16 @@ public:
             tw_.struct_end();
         }
 
-        // field 3: num_rows
         tw_.field_i64(3, total_rows_);
 
-        // field 4: row_groups
         tw_.field_list_begin(4, 12, row_groups_.size());
         for (const auto& rg : row_groups_) {
             tw_.struct_begin();
             tw_.field_list_begin(1, 12, rg.columns.size());
             for (const auto& col : rg.columns) {
                 tw_.struct_begin();
-                tw_.field_i64(2, 0); // file_offset
-                tw_.field_struct_begin(3); // meta_data
+                tw_.field_i64(2, 0);
+                tw_.field_struct_begin(3);
                 tw_.field_i32(1, col.type);
                 if (col.has_rle) {
                     tw_.field_list_begin(2, 5, 2);
@@ -322,7 +343,7 @@ public:
                 }
                 tw_.field_list_begin(3, 8, 1);
                 tw_.list_elem_string(col.name);
-                tw_.field_i32(4, 0); // UNCOMPRESSED
+                tw_.field_i32(4, 0);
                 tw_.field_i64(5, col.num_values);
                 tw_.field_i64(6, col.total_size);
                 tw_.field_i64(7, col.total_size);
@@ -339,9 +360,10 @@ public:
         uint32_t meta_len = static_cast<uint32_t>(tw_.size());
         bool ok = write_raw(tw_.data(), tw_.size()) &&
                   write_raw(&meta_len, 4) &&
-                  write_raw("PAR1", 4);
-        if (fclose(fp_) != 0) ok = false;
-        fp_ = nullptr;
+                  write_raw("PAR1", 4) &&
+                  flush_io();
+        if (::close(fd_) != 0) ok = false;
+        fd_ = -1;
         return ok;
     }
 };

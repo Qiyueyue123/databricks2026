@@ -4,4 +4,5 @@
 !starter-duckdb/pipeline/engine.cpp
 !starter-duckdb/pipeline/csv_fast.hpp
 !starter-duckdb/pipeline/parquet_writer.hpp
+!starter-duckdb/pipeline/pgo_gen.cpp
 !starter-duckdb/run.sh
